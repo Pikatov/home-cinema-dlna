@@ -1,0 +1,8 @@
+build/home-cinema/HomeCinemaServer*
+build/home-cinema/*.log
+build/home-cinema/media_dir.txt
+build/home-cinema/HomeCinemaControl.app/
+build/home-cinema/HomeCinemaControlSwift/Home Cinema Control.app/
+build/home-cinema/HomeCinemaControlSwift/.swift-module-cache/
+build/home-cinema/HomeCinemaControlSwift/HomeCinemaControl
+*.DS_Store
