@@ -35,7 +35,6 @@ cd build/home-cinema/HomeCinemaControlSwift
 ## Конфигурация и приватность
 - Путь к медиатеке передаётся флагом `--media-dir` или через UI; не коммитится.
 - Логи и локальные пути добавлены в `.gitignore`.
-- Перед публикацией очистите каталоги `build/home-cinema/*.log`, `media_dir.txt`, `.app` и бинарники (уже исключены).
 
 ## Лицензия
 MIT — см. файл `LICENSE`.
