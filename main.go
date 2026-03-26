@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bufio"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"net"
 	"net/http"
@@ -19,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/koron/go-ssdp"
@@ -39,6 +45,7 @@ const (
 var (
 	objectIDRe = regexp.MustCompile(`<ObjectID>(.*?)</ObjectID>`)
 	flagRe     = regexp.MustCompile(`<BrowseFlag>(.*?)</BrowseFlag>`)
+	callbackRe = regexp.MustCompile(`<([^>]+)>`)
 
 	serverPort      = defaultServerPort
 	startedAt       = time.Now()
@@ -54,10 +61,197 @@ var (
 	browseCache     = make(map[string]browseCacheEntry)
 )
 
+var (
+	streamDebugEnabled bool
+	streamDebugHeaders bool
+	streamDebugEvery   = 15 * time.Second
+	streamSlowRead     = 200 * time.Millisecond
+	streamSlowWrite    = 200 * time.Millisecond
+
+	streamSeq            uint64
+	activeStreamRequests int64
+)
+
+var browseUpdateID uint32
+
+var (
+	tvStreamEnabled   = true
+	tvVideoCRF        = 22
+	tvVideoMaxrateMb  = 10
+	tvVideoBufsizeMb  = 20
+	tvVideoPreset     = "veryfast"
+	tvAudioKbps       = 192
+	tvAudioChannels   = 2
+	tvContentType     = "video/mpeg"
+	tvDLNAFeatures    = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+)
+
+var (
+	warmupMetaEnabled  = true
+	warmupMetaThrottle time.Duration
+	warmupMetaMaxFiles int
+)
+
 type browseCacheEntry struct {
 	payload string
 	count   int
 	expires time.Time
+}
+
+type upnpEventSub struct {
+	sid      string
+	callback string
+	expires  time.Time
+	seq      uint32
+}
+
+var (
+	eventSubsMu sync.Mutex
+	eventSubs   = make(map[string]*upnpEventSub)
+)
+
+func bumpBrowseUpdateID() uint32 {
+	return atomic.AddUint32(&browseUpdateID, 1)
+}
+
+func currentBrowseUpdateID() uint32 {
+	return atomic.LoadUint32(&browseUpdateID)
+}
+
+func newSID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// fallback: достаточно уникально для локалки
+		return fmt.Sprintf("uuid:%d", time.Now().UnixNano())
+	}
+	return "uuid:" + hex.EncodeToString(b[:])
+}
+
+func parseTimeout(h string) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 30 * time.Minute
+	}
+	upper := strings.ToUpper(h)
+	if strings.HasPrefix(upper, "SECOND-") {
+		n, err := strconv.Atoi(strings.TrimPrefix(upper, "SECOND-"))
+		if err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 30 * time.Minute
+}
+
+func notifyContentDirectory(updateID uint32) {
+	now := time.Now()
+	type target struct {
+		sid      string
+		callback string
+		seq      uint32
+	}
+
+	var targets []target
+	eventSubsMu.Lock()
+	for sid, sub := range eventSubs {
+		if now.After(sub.expires) {
+			delete(eventSubs, sid)
+			continue
+		}
+		targets = append(targets, target{sid: sid, callback: sub.callback, seq: sub.seq})
+		sub.seq++
+	}
+	eventSubsMu.Unlock()
+
+	if len(targets) == 0 {
+		return
+	}
+
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>`+"\n"+
+		`<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0">`+"\n"+
+		`  <e:property><SystemUpdateID>%d</SystemUpdateID></e:property>`+"\n"+
+		`</e:propertyset>`, updateID)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	for _, t := range targets {
+		req, err := http.NewRequest("NOTIFY", t.callback, strings.NewReader(body))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "text/xml; charset=\"utf-8\"")
+		req.Header.Set("NT", "upnp:event")
+		req.Header.Set("NTS", "upnp:propchange")
+		req.Header.Set("SID", t.sid)
+		req.Header.Set("SEQ", strconv.FormatUint(uint64(t.seq), 10))
+		_, _ = client.Do(req)
+	}
+}
+
+func handleEventContentDirectory() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "SUBSCRIBE":
+			sid := strings.TrimSpace(r.Header.Get("SID"))
+			timeout := parseTimeout(r.Header.Get("TIMEOUT"))
+			expires := time.Now().Add(timeout)
+
+			if sid == "" {
+				cb := r.Header.Get("CALLBACK")
+				m := callbackRe.FindStringSubmatch(cb)
+				if len(m) < 2 {
+					http.Error(w, "Missing CALLBACK", http.StatusPreconditionFailed)
+					return
+				}
+				sid = newSID()
+				sub := &upnpEventSub{
+					sid:      sid,
+					callback: strings.TrimSpace(m[1]),
+					expires:  expires,
+				}
+				eventSubsMu.Lock()
+				eventSubs[sid] = sub
+				eventSubsMu.Unlock()
+
+				w.Header().Set("SID", sid)
+				w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", int(timeout.Seconds())))
+				w.WriteHeader(http.StatusOK)
+
+				// initial event
+				go notifyContentDirectory(currentBrowseUpdateID())
+				return
+			}
+
+			// renew
+			eventSubsMu.Lock()
+			sub, ok := eventSubs[sid]
+			if ok {
+				sub.expires = expires
+			}
+			eventSubsMu.Unlock()
+			if !ok {
+				http.Error(w, "Unknown SID", http.StatusPreconditionFailed)
+				return
+			}
+
+			w.Header().Set("SID", sid)
+			w.Header().Set("TIMEOUT", fmt.Sprintf("Second-%d", int(timeout.Seconds())))
+			w.WriteHeader(http.StatusOK)
+			return
+
+		case "UNSUBSCRIBE":
+			sid := strings.TrimSpace(r.Header.Get("SID"))
+			if sid == "" {
+				http.Error(w, "Missing SID", http.StatusPreconditionFailed)
+				return
+			}
+			eventSubsMu.Lock()
+			delete(eventSubs, sid)
+			eventSubsMu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}
 }
 
 // ── ffprobe ───────────────────────────────────────────────────────────────────
@@ -79,6 +273,46 @@ func ffprobeBin() string {
 
 var ffprobeExe = ffprobeBin()
 
+func ffmpegBin() string {
+	for _, p := range []string{
+		"/opt/homebrew/bin/ffmpeg",
+		"/usr/local/bin/ffmpeg",
+		"/usr/bin/ffmpeg",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "ffmpeg"
+}
+
+var ffmpegExe = ffmpegBin()
+
+func isExecutable(path string) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir() && (info.Mode()&0111) != 0
+}
+
+func resolveExec(bin string) (string, bool) {
+	if bin == "" {
+		return "", false
+	}
+	if strings.ContainsRune(bin, filepath.Separator) {
+		return bin, isExecutable(bin)
+	}
+	p, err := exec.LookPath(bin)
+	if err != nil {
+		return "", false
+	}
+	return p, true
+}
+
 type videoMeta struct {
 	DurationSeconds float64
 }
@@ -87,6 +321,43 @@ var (
 	metaCacheMu sync.RWMutex
 	metaCache   = make(map[string]videoMeta)
 )
+
+var (
+	metaWarmMu sync.Mutex
+	metaWarm   = make(map[string]bool)
+	metaWarmSem = make(chan struct{}, 2)
+)
+
+func getVideoMetaCached(filePath string) (videoMeta, bool) {
+	metaCacheMu.RLock()
+	m, ok := metaCache[filePath]
+	metaCacheMu.RUnlock()
+	return m, ok
+}
+
+func warmVideoMetaAsync(filePath string) {
+	if filePath == "" {
+		return
+	}
+	if _, ok := getVideoMetaCached(filePath); ok {
+		return
+	}
+	metaWarmMu.Lock()
+	if metaWarm[filePath] {
+		metaWarmMu.Unlock()
+		return
+	}
+	metaWarm[filePath] = true
+	metaWarmMu.Unlock()
+	go func() {
+		metaWarmSem <- struct{}{}
+		defer func() { <-metaWarmSem }()
+		_ = getVideoMeta(filePath)
+		metaWarmMu.Lock()
+		delete(metaWarm, filePath)
+		metaWarmMu.Unlock()
+	}()
+}
 
 func getVideoMeta(filePath string) videoMeta {
 	metaCacheMu.RLock()
@@ -116,9 +387,13 @@ func getVideoMeta(filePath string) videoMeta {
 }
 
 func warmupMetaCache(dir string) {
+	if !warmupMetaEnabled {
+		return
+	}
 	go func() {
+		errStop := errors.New("warmup done")
 		count := 0
-		_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 			if err != nil || info.IsDir() {
 				return nil
 			}
@@ -126,9 +401,21 @@ func warmupMetaCache(dir string) {
 			if ext == ".mp4" || ext == ".mkv" || ext == ".avi" {
 				getVideoMeta(path)
 				count++
+				if warmupMetaThrottle > 0 {
+					time.Sleep(warmupMetaThrottle)
+				}
+				if warmupMetaMaxFiles > 0 && count >= warmupMetaMaxFiles {
+					return errStop
+				}
+				if streamDebugEnabled && count%50 == 0 {
+					log.Printf("DBG warmup: %d файлов (в процессе) в %s", count, redactPath(dir))
+				}
 			}
 			return nil
 		})
+		if err != nil && !errors.Is(err, errStop) {
+			log.Printf("⚠️ warmup ffprobe: %v", err)
+		}
 		log.Printf("✅ ffprobe кеш: %d файлов в %s", count, redactPath(dir))
 	}()
 }
@@ -136,15 +423,19 @@ func warmupMetaCache(dir string) {
 // ── Прогресс просмотра ────────────────────────────────────────────────────────
 
 type progressEntry struct {
-	Position int64     `json:"position"`
-	Size     int64     `json:"size"`
-	Updated  time.Time `json:"updated"`
+	Position        int64     `json:"position,omitempty"` // byte offset (for /video Range)
+	Size            int64     `json:"size,omitempty"`     // file size for Position validation
+	Seconds         float64   `json:"seconds,omitempty"`  // elapsed seconds (for /tv realtime)
+	DurationSeconds float64   `json:"durationSeconds,omitempty"`
+	Updated         time.Time `json:"updated"`
 }
 
 var (
 	progressMu   sync.RWMutex
 	progressData = make(map[string]progressEntry)
 )
+
+var progressSaveCh = make(chan struct{}, 1)
 
 func loadProgress() {
 	data, err := os.ReadFile(progressFile)
@@ -172,21 +463,108 @@ func loadProgress() {
 
 func saveProgress() {
 	progressMu.RLock()
-	data, _ := json.MarshalIndent(progressData, "", "  ")
+	snapshot := make(map[string]progressEntry, len(progressData))
+	for k, v := range progressData {
+		snapshot[k] = v
+	}
 	progressMu.RUnlock()
+	data, _ := json.Marshal(snapshot)
 	_ = os.WriteFile(progressFile, data, 0600)
 }
 
+func requestProgressSave() {
+	select {
+	case progressSaveCh <- struct{}{}:
+	default:
+	}
+}
+
+func runProgressSaver() {
+	go func() {
+		var (
+			timer        *time.Timer
+			timerC       <-chan time.Time
+			lastWrite    time.Time
+			pending      bool
+			debounce     = 300 * time.Millisecond
+			maxInterval  = 5 * time.Second
+		)
+		for {
+			select {
+			case <-progressSaveCh:
+				pending = true
+
+				if !lastWrite.IsZero() && time.Since(lastWrite) >= maxInterval {
+					saveProgress()
+					lastWrite = time.Now()
+					pending = false
+					if timer != nil {
+						if !timer.Stop() {
+							select {
+							case <-timer.C:
+							default:
+							}
+						}
+						timerC = nil
+						timer = nil
+					}
+					continue
+				}
+
+				if timer == nil {
+					timer = time.NewTimer(debounce)
+					timerC = timer.C
+				} else {
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(debounce)
+				}
+			case <-timerC:
+				if pending {
+					saveProgress()
+					lastWrite = time.Now()
+					pending = false
+				}
+				timerC = nil
+				timer = nil
+			}
+		}
+	}()
+}
+
 func recordProgress(filename string, position, size int64) {
-	// Не сохраняем первые и последние 2% — это probe-запросы
-	if size == 0 || position < size/50 || position > size*49/50 {
+	recordProgressBytes(filename, position, size)
+}
+
+func recordProgressBytes(key string, position, size int64) {
+	if size <= 0 || position <= 0 || position >= size {
 		return
 	}
 	progressMu.Lock()
-	progressData[filename] = progressEntry{Position: position, Size: size, Updated: time.Now()}
+	progressData[key] = progressEntry{Position: position, Size: size, Updated: time.Now()}
 	progressMu.Unlock()
-	saveProgress()
+	requestProgressSave()
 	// Сбрасываем browse-кеш чтобы таймкод обновился при следующем открытии папки
+	invalidateBrowseCache()
+}
+
+func recordProgressSeconds(key string, seconds float64, durationSeconds float64) {
+	// Для /tv хотим быстрый таймкод: сохраняем почти сразу, но отсечём совсем первые секунды
+	// и самый конец (часто это авто-stop/выход).
+	if seconds < 1 {
+		return
+	}
+	if durationSeconds > 0 && seconds > durationSeconds-5 {
+		return
+	}
+	progressMu.Lock()
+	progressData[key] = progressEntry{Seconds: seconds, DurationSeconds: durationSeconds, Updated: time.Now()}
+	progressMu.Unlock()
+	requestProgressSave()
 	invalidateBrowseCache()
 }
 
@@ -198,6 +576,13 @@ func getProgress(filename string, size int64) int64 {
 		return 0
 	}
 	return entry.Position
+}
+
+func getProgressEntry(key string) (progressEntry, bool) {
+	progressMu.RLock()
+	entry, ok := progressData[key]
+	progressMu.RUnlock()
+	return entry, ok
 }
 
 // formatTimecode переводит байтовую позицию в строку вида "1:23:45"
@@ -213,6 +598,67 @@ func formatTimecode(pos, size int64, durationSecs float64) string {
 		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
 	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func formatSecondsTimecode(seconds float64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	total := int(seconds + 0.5)
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func progressKeyFromRelPath(rel string) string {
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
+func getProgressTimecode(relPath string, size int64, durationSecs float64) string {
+	key := progressKeyFromRelPath(relPath)
+	if key == "" {
+		return ""
+	}
+
+	entry, ok := getProgressEntry(key)
+	if !ok {
+		// fallback на старый формат (ключ = имя файла)
+		entry, ok = getProgressEntry(filepath.Base(key))
+	}
+	if !ok {
+		return ""
+	}
+
+	if entry.Seconds > 0 {
+		return formatSecondsTimecode(entry.Seconds)
+	}
+	if entry.Position > 0 && entry.Size == size && durationSecs > 0 {
+		return formatTimecode(entry.Position, size, durationSecs)
+	}
+	return ""
+}
+
+func formatDLNADuration(seconds float64) string {
+	if seconds <= 0 {
+		return ""
+	}
+	totalMillis := int64(seconds * 1000)
+	h := totalMillis / (3600 * 1000)
+	m := (totalMillis / (60 * 1000)) % 60
+	s := (totalMillis / 1000) % 60
+	ms := totalMillis % 1000
+	if h > 99 {
+		h = 99
+	}
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -335,6 +781,8 @@ func invalidateBrowseCache() {
 	browseCacheMu.Lock()
 	browseCache = make(map[string]browseCacheEntry)
 	browseCacheMu.Unlock()
+	updateID := bumpBrowseUpdateID()
+	go notifyContentDirectory(updateID)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -344,15 +792,97 @@ func main() {
 	portFlag := flag.String("port", defaultServerPort, "HTTP порт сервера")
 	dataDirFlag := flag.String("data-dir", defaultDataDir, "Папка для логов/прогресса (HOMECINEMA_DATA_DIR)")
 	allowRemoteControlFlag := flag.Bool("allow-remote-control", false, "Разрешить менять папку медиатеки не только с localhost (НЕ рекомендуется)")
+	debugStreamFlag := flag.Bool("debug-stream", false, "Подробный лог /video (Range/скорость/медленные read/write)")
+	debugStreamHeadersFlag := flag.Bool("debug-stream-headers", false, "При --debug-stream логировать важные DLNA/HTTP заголовки запроса")
+	debugEveryFlag := flag.Duration("debug-stream-every", 15*time.Second, "Как часто логировать прогресс стрима при --debug-stream")
+	slowWriteFlag := flag.Duration("debug-slow-write", 200*time.Millisecond, "Логировать, если запись в сеть дольше этого порога (при --debug-stream)")
+	slowReadFlag := flag.Duration("debug-slow-read", 200*time.Millisecond, "Логировать, если чтение файла дольше этого порога (при --debug-stream)")
+	streamBufMBFlag := flag.Int("stream-buf-mb", 4, "Размер буфера выдачи (МБ), можно уменьшать при подвисаниях")
+	warmupMetaFlag := flag.Bool("warmup-meta", true, "Прогреть кеш длительности (ffprobe) при старте/смене папки (может грузить диск/CPU)")
+	warmupMetaThrottleFlag := flag.Duration("warmup-meta-throttle", 0, "Пауза между ffprobe вызовами при прогреве (например 150ms)")
+	warmupMetaMaxFlag := flag.Int("warmup-meta-max", 0, "Максимум файлов для прогрева (0 = все)")
+	tvStreamFlag := flag.Bool("tv-stream", true, "Добавить TV-версию потока (ffmpeg) и отдавать её как первый <res> (уменьшает тормоза по Wi‑Fi)")
+	tvCRFFlag := flag.Int("tv-crf", 22, "CRF для TV-потока (выше = меньше битрейт/качество)")
+	tvMaxrateFlag := flag.Int("tv-maxrate-mbps", 10, "Максимальный видеобитрейт TV-потока (Mbps)")
+	tvBufsizeFlag := flag.Int("tv-bufsize-mbps", 20, "VBV bufsize для TV-потока (Mbps)")
+	tvPresetFlag := flag.String("tv-preset", "veryfast", "Preset для TV-потока (ffmpeg x264)")
+	tvAudioKbpsFlag := flag.Int("tv-audio-kbps", 192, "Аудиобитрейт TV-потока (kbps, AAC)")
+	tvAudioChFlag := flag.Int("tv-audio-ch", 2, "Аудиоканалы TV-потока (обычно 2)")
+	progressEveryFlag := flag.Duration("progress-every", 1*time.Second, "Как часто сохранять прогресс во время стрима (быстрее обновляет таймкод в названии)")
 	flag.Parse()
 
 	serverPort = *portFlag
 	setMediaDir(*mediaDirFlag)
 	setDataDir(*dataDirFlag)
 	remoteControlOK = *allowRemoteControlFlag
+	streamDebugEnabled = *debugStreamFlag
+	streamDebugHeaders = *debugStreamHeadersFlag
+	streamDebugEvery = *debugEveryFlag
+	streamSlowWrite = *slowWriteFlag
+	streamSlowRead = *slowReadFlag
+	warmupMetaEnabled = *warmupMetaFlag
+	warmupMetaThrottle = *warmupMetaThrottleFlag
+	warmupMetaMaxFiles = *warmupMetaMaxFlag
+	if *streamBufMBFlag < 1 {
+		*streamBufMBFlag = 1
+	}
+	if *streamBufMBFlag > 16 {
+		*streamBufMBFlag = 16
+	}
+	streamBufSize = *streamBufMBFlag * 1024 * 1024
+	streamBufPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, streamBufSize)
+		},
+	}
+
+	tvStreamEnabled = *tvStreamFlag
+	tvVideoCRF = *tvCRFFlag
+	tvVideoMaxrateMb = *tvMaxrateFlag
+	tvVideoBufsizeMb = *tvBufsizeFlag
+	tvVideoPreset = strings.TrimSpace(*tvPresetFlag)
+	tvAudioKbps = *tvAudioKbpsFlag
+	tvAudioChannels = *tvAudioChFlag
+	if tvStreamEnabled {
+		if p, ok := resolveExec(ffmpegExe); ok {
+			ffmpegExe = p
+		} else {
+			log.Printf("⚠️ ffmpeg не найден. Отключаю --tv-stream (можно включить после установки ffmpeg).")
+			tvStreamEnabled = false
+		}
+	}
+	if tvVideoMaxrateMb < 2 {
+		tvVideoMaxrateMb = 2
+	}
+	if tvVideoBufsizeMb < tvVideoMaxrateMb {
+		tvVideoBufsizeMb = tvVideoMaxrateMb * 2
+	}
+	if tvVideoCRF < 16 {
+		tvVideoCRF = 16
+	}
+	if tvVideoCRF > 30 {
+		tvVideoCRF = 30
+	}
+	if tvAudioKbps < 64 {
+		tvAudioKbps = 64
+	}
+	if tvAudioKbps > 384 {
+		tvAudioKbps = 384
+	}
+	if tvAudioChannels < 1 {
+		tvAudioChannels = 1
+	}
+	if tvAudioChannels > 6 {
+		tvAudioChannels = 6
+	}
+	if *progressEveryFlag < 250*time.Millisecond {
+		*progressEveryFlag = 250 * time.Millisecond
+	}
+	progressUpdateEvery = *progressEveryFlag
 
 	initLogger()
 	loadProgress()
+	runProgressSaver()
 	invalidateBrowseCache()
 	warmupMetaCache(getMediaDir())
 
@@ -371,10 +901,16 @@ func main() {
 		fmt.Fprintf(w, deviceDescription, friendlyName, manufacturerName, modelName, uuid)
 	})
 	http.HandleFunc("/ctl/ContentDirectory", handleContentDirectory(ip))
+	http.HandleFunc("/evt/ContentDirectory", handleEventContentDirectory())
 	http.HandleFunc("/video/", func(w http.ResponseWriter, r *http.Request) {
 		relPath := strings.TrimPrefix(r.URL.Path, "/video/")
 		filePath := filepath.Join(getMediaDir(), relPath)
 		serveVideo(w, r, filePath, relPath)
+	})
+	http.HandleFunc("/tv/", func(w http.ResponseWriter, r *http.Request) {
+		relPath := strings.TrimPrefix(r.URL.Path, "/tv/")
+		filePath := filepath.Join(getMediaDir(), relPath)
+		serveTVStream(w, r, filePath, relPath)
 	})
 
 	log.Printf("📡 СЕРВЕР ЗАПУЩЕН | %s | %s", friendlyName, serverAddr)
@@ -547,7 +1083,7 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 		if flag == "BrowseMetadata" {
 			logOnce("⚙️ МЕТАДАННЫЕ: ID=%s", objID)
 			meta := fmt.Sprintf(`&lt;container id="%s" parentID="-1" restricted="1"&gt;&lt;dc:title&gt;Folder&lt;/dc:title&gt;&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;`, objID)
-			fmt.Fprintf(w, soapResponse, meta, 1, 1)
+			fmt.Fprintf(w, soapResponse, meta, 1, 1, currentBrowseUpdateID())
 			return
 		}
 
@@ -562,7 +1098,7 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 
 			if payload, count, ok := getBrowseCache(relPath); ok {
 				logOnce("⚡️ КЕШ: /%s (%d)", relPath, count)
-				fmt.Fprintf(w, soapResponse, payload, count, count)
+				fmt.Fprintf(w, soapResponse, payload, count, count, currentBrowseUpdateID())
 				return
 			}
 
@@ -572,7 +1108,7 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 			files, err := os.ReadDir(filepath.Join(dir, relPath))
 			if err != nil {
 				log.Printf("❌ ОШИБКА ЧТЕНИЯ ПАПКИ: %v", err)
-				fmt.Fprintf(w, soapResponse, "", 0, 0)
+				fmt.Fprintf(w, soapResponse, "", 0, 0, currentBrowseUpdateID())
 				return
 			}
 
@@ -611,25 +1147,44 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					for i, p := range parts {
 						parts[i] = url.PathEscape(p)
 					}
-					fileURL := fmt.Sprintf("http://%s:%s/video/%s", ip, serverPort, strings.Join(parts, "/"))
-
-					proto := "http-get:*:video/mp4:DLNA.ORG_PN=AVC_MP4_HP_HD_24;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+					escapedRel := strings.Join(parts, "/")
+					fileURL := fmt.Sprintf("http://%s:%s/video/%s", ip, serverPort, escapedRel)
+					tvURL := fmt.Sprintf("http://%s:%s/tv/%s", ip, serverPort, escapedRel)
 
 					// Добавляем таймкод в название если есть прогресс
 					title := displayTitle
 					fullPath := filepath.Join(dir, childRelPath)
-					if pos := getProgress(f.Name(), info.Size()); pos > 0 {
-						meta := getVideoMeta(fullPath)
-						if tc := formatTimecode(pos, info.Size(), meta.DurationSeconds); tc != "" {
-							title = fmt.Sprintf("%s [▶ %s]", displayTitle, tc)
-						}
+					mimeType, dlnaProfile := detectContentType(fullPath)
+					proto := fmt.Sprintf("http-get:*:%s:%s", mimeType, dlnaProfile)
+					meta, _ := getVideoMetaCached(fullPath)
+					// В Browse не запускаем ffprobe "на всякий случай" — он может грузить диск.
+					// Если нужен байтовый прогресс, а duration ещё нет — прогреем асинхронно.
+					key := progressKeyFromRelPath(childRelPath)
+					if entry, ok := getProgressEntry(key); ok && entry.Seconds <= 0 && entry.Position > 0 && entry.Size == info.Size() && meta.DurationSeconds <= 0 {
+						warmVideoMetaAsync(fullPath)
 					}
+					if tc := getProgressTimecode(childRelPath, info.Size(), meta.DurationSeconds); tc != "" {
+						title = fmt.Sprintf("%s [▶ %s]", displayTitle, tc)
+					}
+
+					durationAttr := ""
+					if meta.DurationSeconds > 0 {
+						durationAttr = fmt.Sprintf(` duration="%s"`, formatDLNADuration(meta.DurationSeconds))
+					}
+
+					resParts := make([]string, 0, 2)
+					if tvStreamEnabled {
+						tvProto := fmt.Sprintf("http-get:*:%s:%s", tvContentType, tvDLNAFeatures)
+						// size неизвестен (транскод в реальном времени)
+						resParts = append(resParts, fmt.Sprintf(`&lt;res%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, durationAttr, tvProto, tvURL))
+					}
+					resParts = append(resParts, fmt.Sprintf(`&lt;res size="%d"%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, info.Size(), durationAttr, proto, fileURL))
 
 					item := fmt.Sprintf(`&lt;item id="vid-%s" parentID="%s" restricted="1"&gt;`+
 						`&lt;dc:title&gt;%s&lt;/dc:title&gt;`+
 						`&lt;upnp:class&gt;object.item.videoItem&lt;/upnp:class&gt;`+
-						`&lt;res size="%d" protocolInfo="%s"&gt;%s&lt;/res&gt;`+
-						`&lt;/item&gt;`, stableID, objID, title, info.Size(), proto, fileURL)
+						`%s`+
+						`&lt;/item&gt;`, stableID, objID, title, strings.Join(resParts, ""))
 
 					items = append(items, item)
 					count++
@@ -637,7 +1192,7 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 			}
 			payload := strings.Join(items, "")
 			setBrowseCache(relPath, payload, count)
-			fmt.Fprintf(w, soapResponse, payload, count, count)
+			fmt.Fprintf(w, soapResponse, payload, count, count, currentBrowseUpdateID())
 			return
 		}
 	}
@@ -756,6 +1311,10 @@ func respondJSON(w http.ResponseWriter, status int, payload interface{}) {
 // ── Video streaming ───────────────────────────────────────────────────────────
 
 func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPath string) {
+	reqID := atomic.AddUint64(&streamSeq, 1)
+	active := atomic.AddInt64(&activeStreamRequests, 1)
+	defer atomic.AddInt64(&activeStreamRequests, -1)
+
 	file, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("❌ ОШИБКА: Файл не найден: %s", requestedRelPath)
@@ -775,20 +1334,50 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("transferMode.dlna.org", "Streaming")
+	w.Header().Set("TransferMode.dlna.org", "Streaming")
 	w.Header().Set("contentFeatures.dlna.org", dlnaProfile)
+	w.Header().Set("ContentFeatures.dlna.org", dlnaProfile)
 	w.Header().Set("Cache-Control", "no-transform")
 
 	rangeHdr := r.Header.Get("Range")
 	if rangeHdr == "" {
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 		log.Printf("▶️ СТРИМИНГ: %s (без Range)", info.Name())
-		streamFile(w, r, file, 0, info.Size()-1, info.Size())
+		if streamDebugEnabled {
+			extra := ""
+			if streamDebugHeaders {
+				extra = fmt.Sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
+					r.Header.Get("transferMode.dlna.org"),
+					r.Header.Get("GetContentFeatures.dlna.org"),
+					r.Header.Get("TimeSeekRange.dlna.org"),
+					r.Header.Get("Connection"),
+				)
+			}
+			log.Printf("DBG stream#%d active=%d %s %s ua=%q file=%q size=%d%s", reqID, active, r.Method, r.RemoteAddr, shortUA(r.UserAgent()), requestedRelPath, info.Size(), extra)
+		}
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		streamFile(w, r, file, reqID, requestedRelPath, progressKeyFromRelPath(requestedRelPath), 0, info.Size()-1, info.Size())
 		return
 	}
 
 	start, end, ok := parseRange(rangeHdr, info.Size())
 	if !ok {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
+		if streamDebugEnabled {
+			extra := ""
+			if streamDebugHeaders {
+				extra = fmt.Sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
+					r.Header.Get("transferMode.dlna.org"),
+					r.Header.Get("GetContentFeatures.dlna.org"),
+					r.Header.Get("TimeSeekRange.dlna.org"),
+					r.Header.Get("Connection"),
+				)
+			}
+			log.Printf("DBG stream#%d active=%d %s %s ua=%q file=%q bad_range=%q size=%d%s", reqID, active, r.Method, r.RemoteAddr, shortUA(r.UserAgent()), requestedRelPath, rangeHdr, info.Size(), extra)
+		}
 		http.Error(w, "Неверный диапазон", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
@@ -803,37 +1392,132 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 		return
 	}
 	logOnce("⏩ RANGE: %s [%d-%d]", info.Name(), start, end)
-	streamFile(w, r, file, start, end, info.Size())
+	if streamDebugEnabled {
+		extra := ""
+		if streamDebugHeaders {
+			extra = fmt.Sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
+				r.Header.Get("transferMode.dlna.org"),
+				r.Header.Get("GetContentFeatures.dlna.org"),
+				r.Header.Get("TimeSeekRange.dlna.org"),
+				r.Header.Get("Connection"),
+			)
+		}
+		log.Printf("DBG stream#%d active=%d %s %s ua=%q file=%q range=%d-%d len=%d total=%d%s", reqID, active, r.Method, r.RemoteAddr, shortUA(r.UserAgent()), requestedRelPath, start, end, length, info.Size(), extra)
+	}
+	if r.Method == http.MethodHead {
+		return
+	}
+	streamFile(w, r, file, reqID, requestedRelPath, progressKeyFromRelPath(requestedRelPath), start, end, info.Size())
 }
 
-func streamFile(w http.ResponseWriter, r *http.Request, file *os.File, start, end, totalSize int64) {
-	filename := filepath.Base(file.Name())
+var streamBufSize = 4 * 1024 * 1024
+
+var streamBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, streamBufSize)
+	},
+}
+
+var progressUpdateEvery = 3 * time.Second
+
+func streamFile(w http.ResponseWriter, r *http.Request, file *os.File, reqID uint64, requestedRelPath, progressKey string, start, end, totalSize int64) {
 	length := end - start + 1
 
 	// Probe-соединения не пишем в прогресс:
 	// маленький range (< 1MB) или конец файла
 	isProbe := length < 1024*1024 || start > totalSize*9/10
 
-	const bufSize = 4 * 1024 * 1024
-	buf := make([]byte, bufSize)
+	buf := streamBufPool.Get().([]byte)
+	defer streamBufPool.Put(buf)
 	remaining := length
 	written := start
 	flusher, _ := w.(http.Flusher)
 	lastSaved := time.Now()
+	started := time.Now()
+	lastDbg := started
+	endReason := "unknown"
+	var endErr error
+	var (
+		chunkCount   int64
+		minChunkMbps = math.Inf(1)
+		maxChunkMbps float64
+		lastChunkMbps float64
+	)
+
+	defer func() {
+		if streamDebugEnabled {
+			dur := time.Since(started)
+			sent := written - start
+			mbps := 0.0
+			if dur > 0 {
+				mbps = (float64(sent) * 8) / dur.Seconds() / 1e6
+			}
+			errStr := ""
+			if endErr != nil {
+				errStr = fmt.Sprintf(" err=%q", endErr.Error())
+			}
+			minStr := "n/a"
+			if chunkCount > 0 && minChunkMbps != math.Inf(1) {
+				minStr = fmt.Sprintf("%.2f", minChunkMbps)
+			}
+			log.Printf("DBG stream#%d done file=%q sent=%d dur=%s avg_mbps=%.2f reason=%s%s", reqID, requestedRelPath, sent, dur.Round(time.Millisecond), mbps, endReason, errStr)
+			log.Printf("DBG stream#%d stats file=%q chunks=%d min_chunk_mbps=%s max_chunk_mbps=%.2f buf=%d", reqID, requestedRelPath, chunkCount, minStr, maxChunkMbps, len(buf))
+		}
+	}()
 
 	for remaining > 0 {
-		chunkSize := int64(bufSize)
+		chunkSize := int64(len(buf))
+		if written == start && chunkSize > 256*1024 {
+			// Первый чанк делаем маленьким: многие ТВ/клиенты делают probe-запросы и
+			// быстро закрывают соединение — не хотим зря читать 4MB с диска.
+			chunkSize = 256 * 1024
+		}
 		if remaining < chunkSize {
 			chunkSize = remaining
 		}
+		readStart := time.Now()
 		n, err := file.Read(buf[:chunkSize])
+		readDur := time.Since(readStart)
+		if streamDebugEnabled && readDur > streamSlowRead {
+			log.Printf("DBG stream#%d slow_read=%s file=%q off=%d want=%d got=%d", reqID, readDur.Round(time.Millisecond), requestedRelPath, written, chunkSize, n)
+		}
 		if n > 0 {
-			if _, wErr := w.Write(buf[:n]); wErr != nil {
+			writeStart := time.Now()
+			_, wErr := w.Write(buf[:n])
+			writeDur := time.Since(writeStart)
+			chunkMbps := 0.0
+			if writeDur > 0 {
+				chunkMbps = (float64(n) * 8) / writeDur.Seconds() / 1e6
+			}
+			lastChunkMbps = chunkMbps
+			chunkCount++
+			if chunkMbps > 0 && chunkMbps < minChunkMbps {
+				minChunkMbps = chunkMbps
+			}
+			if chunkMbps > maxChunkMbps {
+				maxChunkMbps = chunkMbps
+			}
+			if streamDebugEnabled && writeDur > streamSlowWrite {
+				curSent := written - start
+				curDur := time.Since(started)
+				curMbps := 0.0
+				if curDur > 0 {
+					curMbps = (float64(curSent) * 8) / curDur.Seconds() / 1e6
+				}
+				log.Printf("DBG stream#%d slow_write=%s file=%q off=%d n=%d rem=%d chunk_mbps=%.2f avg_mbps=%.2f", reqID, writeDur.Round(time.Millisecond), requestedRelPath, written, n, remaining, chunkMbps, curMbps)
+			}
+			if wErr != nil {
+				if isClientClosed(wErr) {
+					endReason = "client_closed"
+				} else {
+					endReason = "write_error"
+				}
+				endErr = wErr
 				if !isClientClosed(wErr) {
 					log.Printf("❌ Ошибка выдачи: %v", wErr)
 				}
 				if !isProbe {
-					recordProgress(filename, written, totalSize)
+					recordProgressBytes(progressKey, written, totalSize)
 				}
 				return
 			}
@@ -843,29 +1527,56 @@ func streamFile(w http.ResponseWriter, r *http.Request, file *os.File, start, en
 			written += int64(n)
 			remaining -= int64(n)
 
-			if !isProbe && time.Since(lastSaved) > 10*time.Second {
-				recordProgress(filename, written, totalSize)
-				log.Printf("💾 %s → %.0f%%", filename, float64(written)/float64(totalSize)*100)
+			if !isProbe && time.Since(lastSaved) > progressUpdateEvery {
+				recordProgressBytes(progressKey, written, totalSize)
+				log.Printf("💾 %s → %.0f%%", filepath.Base(requestedRelPath), float64(written)/float64(totalSize)*100)
 				lastSaved = time.Now()
+			}
+
+			if streamDebugEnabled && time.Since(lastDbg) >= streamDebugEvery {
+				sent := written - start
+				dur := time.Since(started)
+				mbps := 0.0
+				if dur > 0 {
+					mbps = (float64(sent) * 8) / dur.Seconds() / 1e6
+				}
+				minNow := 0.0
+				if minChunkMbps != math.Inf(1) {
+					minNow = minChunkMbps
+				}
+				log.Printf("DBG stream#%d tick file=%q sent=%d rem=%d dur=%s avg_mbps=%.2f last_chunk_mbps=%.2f min_chunk_mbps=%.2f max_chunk_mbps=%.2f",
+					reqID, requestedRelPath, sent, remaining, dur.Round(time.Millisecond), mbps, lastChunkMbps, minNow, maxChunkMbps)
+				lastDbg = time.Now()
 			}
 		}
 		if err != nil {
 			if err != io.EOF && !isClientClosed(err) {
+				endReason = "read_error"
+				endErr = err
 				log.Printf("❌ Ошибка чтения: %v", err)
+				return
+			}
+			if err == io.EOF {
+				endReason = "eof"
+				endErr = err
 			}
 			return
 		}
 
 		select {
 		case <-r.Context().Done():
+			endReason = "client_cancel"
+			endErr = r.Context().Err()
 			if !isProbe {
-				recordProgress(filename, written, totalSize)
-				log.Printf("💾 СТОП: %s → %.0f%%", filename, float64(written)/float64(totalSize)*100)
+				recordProgressBytes(progressKey, written, totalSize)
+				log.Printf("💾 СТОП: %s → %.0f%%", filepath.Base(requestedRelPath), float64(written)/float64(totalSize)*100)
 			}
 			return
 		default:
 		}
 	}
+
+	endReason = "finished"
 }
 
 func isClientClosed(err error) bool {
@@ -876,6 +1587,18 @@ func isClientClosed(err error) bool {
 	return strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "reset by peer") ||
 		strings.Contains(s, "socket is not connected")
+}
+
+func shortUA(ua string) string {
+	ua = strings.TrimSpace(ua)
+	if ua == "" {
+		return ""
+	}
+	const max = 120
+	if len(ua) <= max {
+		return ua
+	}
+	return ua[:max] + "…"
 }
 
 func detectContentType(path string) (string, string) {
@@ -893,6 +1616,165 @@ func detectContentType(path string) (string, string) {
 		}
 		return "application/octet-stream", "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 	}
+}
+
+type flushWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if n > 0 && fw.f != nil {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRelPath string) {
+	if !tvStreamEnabled {
+		http.NotFound(w, r)
+		return
+	}
+
+	info, err := os.Stat(filePath)
+	if err != nil || info.IsDir() {
+		log.Printf("❌ ОШИБКА: Файл не найден: %s", requestedRelPath)
+		http.NotFound(w, r)
+		return
+	}
+
+	meta, metaOK := getVideoMetaCached(filePath)
+	if !metaOK {
+		// не задерживаем старт /tv ожиданием ffprobe
+		warmVideoMetaAsync(filePath)
+	}
+	progressKey := progressKeyFromRelPath(requestedRelPath)
+
+	w.Header().Set("Content-Type", tvContentType)
+	w.Header().Set("transferMode.dlna.org", "Streaming")
+	w.Header().Set("TransferMode.dlna.org", "Streaming")
+	w.Header().Set("contentFeatures.dlna.org", tvDLNAFeatures)
+	w.Header().Set("ContentFeatures.dlna.org", tvDLNAFeatures)
+	w.Header().Set("Cache-Control", "no-transform")
+
+	// Range для live-транскода не поддерживаем.
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Header.Get("Range") != "" {
+		// Некоторые ТВ пытаются Range даже для live-ресурса — игнорируем и отдаём 200.
+		logOnce("⚠️ TV stream: игнор Range для %s", requestedRelPath)
+	}
+
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		// Ускоряем старт (меньше probe/analysis на входе).
+		"-analyzeduration", "200000",
+		"-probesize", "65536",
+		"-i", filePath,
+		"-map", "0:v:0",
+		"-map", "0:a:0?",
+		"-sn",
+		"-c:v", "libx264",
+		"-preset", tvVideoPreset,
+		"-tune", "zerolatency",
+		"-g", "48",
+		"-keyint_min", "48",
+		"-sc_threshold", "0",
+		"-bf", "0",
+		"-pix_fmt", "yuv420p",
+		"-crf", strconv.Itoa(tvVideoCRF),
+		"-maxrate", fmt.Sprintf("%dM", tvVideoMaxrateMb),
+		"-bufsize", fmt.Sprintf("%dM", tvVideoBufsizeMb),
+		"-c:a", "aac",
+		"-b:a", fmt.Sprintf("%dk", tvAudioKbps),
+		"-ac", strconv.Itoa(tvAudioChannels),
+		"-ar", "48000",
+		"-f", "mpegts",
+		"-mpegts_flags", "+resend_headers",
+		"-flush_packets", "1",
+		"-max_interleave_delta", "0",
+		"-muxdelay", "0",
+		"-muxpreload", "0",
+		"pipe:1",
+	}
+
+	t0 := time.Now()
+	cmd := exec.CommandContext(r.Context(), ffmpegExe, args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		http.Error(w, "Не удалось запустить ffmpeg", http.StatusInternalServerError)
+		return
+	}
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		http.Error(w, "Не удалось запустить ffmpeg", http.StatusInternalServerError)
+		return
+	}
+	if streamDebugEnabled {
+		log.Printf("DBG tv_start file=%q ffmpeg_start=%s", requestedRelPath, time.Since(t0).Round(time.Millisecond))
+	}
+
+	go func() {
+		if stderr == nil {
+			return
+		}
+		s := bufio.NewScanner(stderr)
+		for s.Scan() {
+			log.Printf("ffmpeg(tv) %s: %s", filepath.Base(requestedRelPath), s.Text())
+		}
+	}()
+
+	log.Printf("📺 TV stream: %s (maxrate=%dM buf=%dM crf=%d aac=%dk ch=%d)", requestedRelPath, tvVideoMaxrateMb, tvVideoBufsizeMb, tvVideoCRF, tvAudioKbps, tvAudioChannels)
+
+	flusher, _ := w.(http.Flusher)
+	out := io.Writer(w)
+	if flusher != nil {
+		out = flushWriter{w: w, f: flusher}
+	}
+
+	// Обновление прогресса по времени (приблизительно).
+	started := time.Now()
+	lastSaved := time.Now()
+	firstByteLogged := false
+	copyBuf := make([]byte, 64*1024)
+	for {
+		n, rErr := stdout.Read(copyBuf)
+		if n > 0 {
+			if !firstByteLogged {
+				firstByteLogged = true
+				if streamDebugEnabled {
+					log.Printf("DBG tv_first_byte file=%q after=%s", requestedRelPath, time.Since(t0).Round(time.Millisecond))
+				}
+			}
+			if _, wErr := out.Write(copyBuf[:n]); wErr != nil {
+				break
+			}
+			if time.Since(lastSaved) >= progressUpdateEvery {
+				elapsed := time.Since(started).Seconds()
+				recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
+				lastSaved = time.Now()
+			}
+		}
+		if rErr != nil {
+			break
+		}
+		select {
+		case <-r.Context().Done():
+			break
+		default:
+		}
+	}
+	// финальный прогресс (если успели начать)
+	elapsed := time.Since(started).Seconds()
+	recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
+
+	_ = cmd.Wait()
 }
 
 func parseRange(h string, size int64) (start, end int64, ok bool) {
@@ -963,4 +1845,4 @@ const deviceDescription = `<?xml version="1.0"?>
 
 const soapResponse = `<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body><u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Result>&lt;didl-lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;%s&lt;/didl-lite&gt;</Result><NumberReturned>%d</NumberReturned><TotalMatches>%d</TotalMatches><UpdateID>1</UpdateID></u:BrowseResponse></s:Body></s:Envelope>`
+<s:Body><u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Result>&lt;didl-lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/"&gt;%s&lt;/didl-lite&gt;</Result><NumberReturned>%d</NumberReturned><TotalMatches>%d</TotalMatches><UpdateID>%d</UpdateID></u:BrowseResponse></s:Body></s:Envelope>`
