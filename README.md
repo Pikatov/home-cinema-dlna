@@ -56,6 +56,10 @@ curl -s -X POST --data-urlencode mediaDir="$HOME/Movies" http://127.0.0.1:8080/s
 ```
 
 ## SwiftUI-приложение управления (macOS)
+
+<img width="1012" height="564" alt="Снимок экрана 2026-03-29 в 10 45 05" src="https://github.com/user-attachments/assets/1b69e1b5-4241-4d5f-bfe6-9b299cf58dcd" />
+
+
 Сборка:
 ```bash
 cd build/home-cinema/HomeCinemaControlSwift
