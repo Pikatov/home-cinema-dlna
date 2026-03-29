@@ -88,3 +88,6 @@ brew install create-dmg
 
 ## Лицензия
 MIT — см. `LICENSE`.
+
+## Changelog
+См. `CHANGELOG.md`.

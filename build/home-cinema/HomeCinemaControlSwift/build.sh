@@ -12,6 +12,12 @@ SDK=$(xcrun --show-sdk-path --sdk macosx)
 export SWIFT_MODULE_CACHE_PATH="$SRC_DIR/.swift-module-cache"
 mkdir -p "$SWIFT_MODULE_CACHE_PATH"
 
+# Sandbox-friendly Go caches (avoid ~/Library/Caches and ~/go outside workspace)
+export GOCACHE="$SRC_DIR/.go-build-cache"
+export GOPATH="$SRC_DIR/.go"
+export GOMODCACHE="$GOPATH/pkg/mod"
+mkdir -p "$GOCACHE" "$GOMODCACHE"
+
 # Targets
 SWIFT_TARGET_ARM64="arm64-apple-macos12"
 SWIFT_TARGET_X86="x86_64-apple-macos12"
@@ -26,8 +32,9 @@ mv "$ICONSET_BASE" "$ICONSET_DIR"
 
 # Build server binary (arm64 macOS) next to this script
 echo "Building server binary (universal)..."
-GOOS=darwin GOARCH=arm64 go build -o "$SRC_DIR/../HomeCinemaServer-arm64" ../../../main.go
-GOOS=darwin GOARCH=amd64 go build -o "$SRC_DIR/../HomeCinemaServer-x86_64" ../../../main.go
+SERVER_SRC="$SRC_DIR/../../../main.go"
+GOOS=darwin GOARCH=arm64 go build -o "$SRC_DIR/../HomeCinemaServer-arm64" "$SERVER_SRC"
+GOOS=darwin GOARCH=amd64 go build -o "$SRC_DIR/../HomeCinemaServer-x86_64" "$SERVER_SRC"
 lipo -create -output "$SRC_DIR/../HomeCinemaServer" "$SRC_DIR/../HomeCinemaServer-arm64" "$SRC_DIR/../HomeCinemaServer-x86_64"
 rm -f "$SRC_DIR/../HomeCinemaServer-arm64" "$SRC_DIR/../HomeCinemaServer-x86_64"
 

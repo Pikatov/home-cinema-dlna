@@ -35,6 +35,7 @@ const (
 	friendlyName      = "Home Cinema"
 	manufacturerName  = "Home Cinema"
 	modelName         = "HomeCinemaStreamer"
+	appVersion        = "1.3"
 	uuid              = "673f-431d-90b6-homecinema-001"
 	logFileName       = "server.log"
 	browseCacheTTL    = 5 * time.Second
@@ -75,15 +76,16 @@ var (
 var browseUpdateID uint32
 
 var (
-	tvStreamEnabled   = true
-	tvVideoCRF        = 22
-	tvVideoMaxrateMb  = 10
-	tvVideoBufsizeMb  = 20
-	tvVideoPreset     = "veryfast"
-	tvAudioKbps       = 192
-	tvAudioChannels   = 2
-	tvContentType     = "video/mpeg"
-	tvDLNAFeatures    = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+	tvStreamEnabled  = true
+	tvStreamFirst    = false
+	tvVideoCRF       = 22
+	tvVideoMaxrateMb = 10
+	tvVideoBufsizeMb = 20
+	tvVideoPreset    = "veryfast"
+	tvAudioKbps      = 192
+	tvAudioChannels  = 2
+	tvContentType    = "video/mpeg"
+	tvDLNAFeatures   = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 )
 
 var (
@@ -323,8 +325,8 @@ var (
 )
 
 var (
-	metaWarmMu sync.Mutex
-	metaWarm   = make(map[string]bool)
+	metaWarmMu  sync.Mutex
+	metaWarm    = make(map[string]bool)
 	metaWarmSem = make(chan struct{}, 2)
 )
 
@@ -482,12 +484,12 @@ func requestProgressSave() {
 func runProgressSaver() {
 	go func() {
 		var (
-			timer        *time.Timer
-			timerC       <-chan time.Time
-			lastWrite    time.Time
-			pending      bool
-			debounce     = 300 * time.Millisecond
-			maxInterval  = 5 * time.Second
+			timer       *time.Timer
+			timerC      <-chan time.Time
+			lastWrite   time.Time
+			pending     bool
+			debounce    = 300 * time.Millisecond
+			maxInterval = 5 * time.Second
 		)
 		for {
 			select {
@@ -661,6 +663,19 @@ func formatDLNADuration(seconds float64) string {
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
 }
 
+func setDLNATimeSeekHeaders(w http.ResponseWriter, durationSeconds float64) {
+	if durationSeconds <= 0 {
+		return
+	}
+	dur := formatDLNADuration(durationSeconds)
+	if dur == "" {
+		return
+	}
+	w.Header().Set("Content-Duration", dur)
+	w.Header().Set("TimeSeekRange.dlna.org", fmt.Sprintf("npt=00:00:00.000-%s/%s", dur, dur))
+	w.Header().Set("X-Seek-Range", fmt.Sprintf("npt=0-%.0f", durationSeconds))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func resolveDefaultMediaDir() string {
@@ -801,7 +816,8 @@ func main() {
 	warmupMetaFlag := flag.Bool("warmup-meta", true, "Прогреть кеш длительности (ffprobe) при старте/смене папки (может грузить диск/CPU)")
 	warmupMetaThrottleFlag := flag.Duration("warmup-meta-throttle", 0, "Пауза между ffprobe вызовами при прогреве (например 150ms)")
 	warmupMetaMaxFlag := flag.Int("warmup-meta-max", 0, "Максимум файлов для прогрева (0 = все)")
-	tvStreamFlag := flag.Bool("tv-stream", true, "Добавить TV-версию потока (ffmpeg) и отдавать её как первый <res> (уменьшает тормоза по Wi‑Fi)")
+	tvStreamFlag := flag.Bool("tv-stream", true, "Добавить TV-версию потока (ffmpeg) как альтернативный <res> (уменьшает тормоза по Wi‑Fi)")
+	tvStreamFirstFlag := flag.Bool("tv-stream-first", false, "Ставить TV-поток (ffmpeg) первым <res> (ТВ чаще выбирает первый ресурс, но может пропасть прогресс/длительность)")
 	tvCRFFlag := flag.Int("tv-crf", 22, "CRF для TV-потока (выше = меньше битрейт/качество)")
 	tvMaxrateFlag := flag.Int("tv-maxrate-mbps", 10, "Максимальный видеобитрейт TV-потока (Mbps)")
 	tvBufsizeFlag := flag.Int("tv-bufsize-mbps", 20, "VBV bufsize для TV-потока (Mbps)")
@@ -837,6 +853,7 @@ func main() {
 	}
 
 	tvStreamEnabled = *tvStreamFlag
+	tvStreamFirst = *tvStreamFirstFlag
 	tvVideoCRF = *tvCRFFlag
 	tvVideoMaxrateMb = *tvMaxrateFlag
 	tvVideoBufsizeMb = *tvBufsizeFlag
@@ -1026,10 +1043,10 @@ func respondMSearch(ip string) {
 			"DATE: %s\r\n"+
 			"EXT:\r\n"+
 			"LOCATION: %s\r\n"+
-			"SERVER: MacOS/13.0 UPnP/1.0 DLNADOC/1.50 HomeCinema/1.0\r\n"+
+			"SERVER: MacOS/13.0 UPnP/1.0 DLNADOC/1.50 HomeCinema/%s\r\n"+
 			"ST: %s\r\n"+
 			"USN: uuid:%s::%s\r\n"+
-			"\r\n", time.Now().UTC().Format(time.RFC1123), location, st, uuid, st)
+			"\r\n", time.Now().UTC().Format(time.RFC1123), location, appVersion, st, uuid, st)
 
 		if _, err := conn.WriteToUDP([]byte(res), src); err != nil {
 			log.Printf("SSDP write error: %v", err)
@@ -1078,7 +1095,7 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 		}
 
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
-		w.Header().Set("Server", "Linux/2.6 UPnP/1.0 DLNADOC/1.50 HomeCinema/1.0")
+		w.Header().Set("Server", fmt.Sprintf("Linux/2.6 UPnP/1.0 DLNADOC/1.50 HomeCinema/%s", appVersion))
 
 		if flag == "BrowseMetadata" {
 			logOnce("⚙️ МЕТАДАННЫЕ: ID=%s", objID)
@@ -1176,9 +1193,16 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					if tvStreamEnabled {
 						tvProto := fmt.Sprintf("http-get:*:%s:%s", tvContentType, tvDLNAFeatures)
 						// size неизвестен (транскод в реальном времени)
-						resParts = append(resParts, fmt.Sprintf(`&lt;res%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, durationAttr, tvProto, tvURL))
+						tvRes := fmt.Sprintf(`&lt;res%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, durationAttr, tvProto, tvURL)
+						fileRes := fmt.Sprintf(`&lt;res size="%d"%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, info.Size(), durationAttr, proto, fileURL)
+						if tvStreamFirst {
+							resParts = append(resParts, tvRes, fileRes)
+						} else {
+							resParts = append(resParts, fileRes, tvRes)
+						}
+					} else {
+						resParts = append(resParts, fmt.Sprintf(`&lt;res size="%d"%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, info.Size(), durationAttr, proto, fileURL))
 					}
-					resParts = append(resParts, fmt.Sprintf(`&lt;res size="%d"%s protocolInfo="%s"&gt;%s&lt;/res&gt;`, info.Size(), durationAttr, proto, fileURL))
 
 					item := fmt.Sprintf(`&lt;item id="vid-%s" parentID="%s" restricted="1"&gt;`+
 						`&lt;dc:title&gt;%s&lt;/dc:title&gt;`+
@@ -1330,6 +1354,10 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 	}
 
 	ctype, dlnaProfile := detectContentType(filePath)
+	meta, metaOK := getVideoMetaCached(filePath)
+	if !metaOK || meta.DurationSeconds <= 0 {
+		meta = getVideoMeta(filePath)
+	}
 
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Accept-Ranges", "bytes")
@@ -1337,6 +1365,7 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 	w.Header().Set("TransferMode.dlna.org", "Streaming")
 	w.Header().Set("contentFeatures.dlna.org", dlnaProfile)
 	w.Header().Set("ContentFeatures.dlna.org", dlnaProfile)
+	setDLNATimeSeekHeaders(w, meta.DurationSeconds)
 	w.Header().Set("Cache-Control", "no-transform")
 
 	rangeHdr := r.Header.Get("Range")
@@ -1438,9 +1467,9 @@ func streamFile(w http.ResponseWriter, r *http.Request, file *os.File, reqID uin
 	endReason := "unknown"
 	var endErr error
 	var (
-		chunkCount   int64
-		minChunkMbps = math.Inf(1)
-		maxChunkMbps float64
+		chunkCount    int64
+		minChunkMbps  = math.Inf(1)
+		maxChunkMbps  float64
 		lastChunkMbps float64
 	)
 
