@@ -1,4 +1,4 @@
-module hello-go
+module github.com/Pikatov/home-cinema-dlna
 
 go 1.26.1
 

@@ -6,9 +6,14 @@ build/home-cinema/media_dir.txt
 build/home-cinema/HomeCinemaControl.app/
 build/home-cinema/HomeCinemaControlSwift/Home Cinema Control.app/
 build/home-cinema/HomeCinemaControlSwift/.swift-module-cache/
+build/home-cinema/HomeCinemaControlSwift/.clang-module-cache/
+build/home-cinema/HomeCinemaControlSwift/.tmp/
 build/home-cinema/HomeCinemaControlSwift/.go/
 build/home-cinema/HomeCinemaControlSwift/.go-build-cache/
 build/home-cinema/HomeCinemaControlSwift/HomeCinemaControl
+build/home-cinema/HomeCinemaControlSwift/*.zip
+.go/
+.go-build-cache/
 server.log
 progress.json
 homecinema

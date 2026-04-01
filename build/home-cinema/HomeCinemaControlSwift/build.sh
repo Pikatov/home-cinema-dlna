@@ -12,6 +12,10 @@ SDK=$(xcrun --show-sdk-path --sdk macosx)
 export SWIFT_MODULE_CACHE_PATH="$SRC_DIR/.swift-module-cache"
 mkdir -p "$SWIFT_MODULE_CACHE_PATH"
 
+# Sandbox-friendly clang module cache (avoid ~/.cache/clang/ModuleCache)
+CLANG_MODULE_CACHE_PATH="$SRC_DIR/.clang-module-cache"
+mkdir -p "$CLANG_MODULE_CACHE_PATH"
+
 # Sandbox-friendly Go caches (avoid ~/Library/Caches and ~/go outside workspace)
 export GOCACHE="$SRC_DIR/.go-build-cache"
 export GOPATH="$SRC_DIR/.go"
@@ -22,13 +26,8 @@ mkdir -p "$GOCACHE" "$GOMODCACHE"
 SWIFT_TARGET_ARM64="arm64-apple-macos12"
 SWIFT_TARGET_X86="x86_64-apple-macos12"
 
-# Icon setup (choose first existing)
+# Icon setup
 ICON_SRC="$SRC_DIR/icon.png"
-ICON_NAME=HomeCinema
-ICON_ICNS="$RES_DIR/${ICON_NAME}.icns"
-ICONSET_BASE=$(mktemp -d /tmp/homecinema.iconset.XXXXXX)
-ICONSET_DIR="${ICONSET_BASE}.iconset"
-mv "$ICONSET_BASE" "$ICONSET_DIR"
 
 # Build server binary (arm64 macOS) next to this script
 echo "Building server binary (universal)..."
@@ -42,39 +41,34 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 cp "$PLIST_SRC" "$APP_DIR/Contents/Info.plist"
 
-# Generate .icns if source PNG exists
-if [ -n "$ICON_SRC" ]; then
-  echo "Generating app icon from $ICON_SRC"
-  sips -z 16 16     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
-  sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null
-  sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32.png" >/dev/null
-  sips -z 64 64     "$ICON_SRC" --out "$ICONSET_DIR/icon_32x32@2x.png" >/dev/null
-  sips -z 128 128   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128.png" >/dev/null
-  sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_128x128@2x.png" >/dev/null
-  sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256.png" >/dev/null
-  sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256@2x.png" >/dev/null
-  sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512.png" >/dev/null
-  cp "$ICON_SRC" "$ICONSET_DIR/icon_512x512@2x.png"
-  iconutil -c icns "$ICONSET_DIR" -o "$ICON_ICNS"
+# Bundle the source PNG icon (used as app icon via Info.plist)
+if [ -f "$ICON_SRC" ]; then
+  cp "$ICON_SRC" "$RES_DIR/icon.png"
 else
-  echo "Icon source not found, skipping icon generation."
+  echo "Icon source not found, skipping icon copy."
 fi
 
 # Build SwiftUI app (universal)
 echo "Building UI (universal)..."
 swiftc -sdk "$SDK" -target "$SWIFT_TARGET_ARM64" \
+  -module-cache-path "$SWIFT_MODULE_CACHE_PATH" \
+  -Xcc -fmodules-cache-path="$CLANG_MODULE_CACHE_PATH" \
   -o "$MACOS_DIR/$BIN_NAME-arm64" \
   -framework SwiftUI -framework Combine -framework AppKit \
   -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
   -emit-executable "${SWIFT_FILES[@]}"
 
 swiftc -sdk "$SDK" -target "$SWIFT_TARGET_X86" \
+  -module-cache-path "$SWIFT_MODULE_CACHE_PATH" \
+  -Xcc -fmodules-cache-path="$CLANG_MODULE_CACHE_PATH" \
   -o "$MACOS_DIR/$BIN_NAME-x86_64" \
   -framework SwiftUI -framework Combine -framework AppKit \
   -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
   -emit-executable "${SWIFT_FILES[@]}"
 
-lipo -create -output "$MACOS_DIR/$BIN_NAME" "$MACOS_DIR/$BIN_NAME-arm64" "$MACOS_DIR/$BIN_NAME-x86_64"
+UI_FAT_TMP=$(mktemp -t homecinema.ui.XXXXXX)
+lipo -create -output "$UI_FAT_TMP" "$MACOS_DIR/$BIN_NAME-arm64" "$MACOS_DIR/$BIN_NAME-x86_64"
+mv -f "$UI_FAT_TMP" "$MACOS_DIR/$BIN_NAME"
 rm -f "$MACOS_DIR/$BIN_NAME-arm64" "$MACOS_DIR/$BIN_NAME-x86_64"
 
 # Embed server binary into the app bundle
@@ -85,7 +79,5 @@ chmod +x "$MACOS_DIR/HomeCinemaServer"
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --deep --sign - "$APP_DIR"
 fi
-
-rm -rf "$ICONSET_DIR"
 
 echo "Built $APP_DIR"

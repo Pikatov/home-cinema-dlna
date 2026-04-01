@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -35,7 +36,7 @@ const (
 	friendlyName      = "Home Cinema"
 	manufacturerName  = "Home Cinema"
 	modelName         = "HomeCinemaStreamer"
-	appVersion        = "1.3"
+	appVersion        = "1.4"
 	uuid              = "673f-431d-90b6-homecinema-001"
 	logFileName       = "server.log"
 	browseCacheTTL    = 5 * time.Second
@@ -920,13 +921,31 @@ func main() {
 	http.HandleFunc("/ctl/ContentDirectory", handleContentDirectory(ip))
 	http.HandleFunc("/evt/ContentDirectory", handleEventContentDirectory())
 	http.HandleFunc("/video/", func(w http.ResponseWriter, r *http.Request) {
-		relPath := strings.TrimPrefix(r.URL.Path, "/video/")
-		filePath := filepath.Join(getMediaDir(), relPath)
+		relRaw := strings.TrimPrefix(r.URL.Path, "/video/")
+		relPath, ok := safeMediaRelPathFromURL(relRaw)
+		if !ok || relPath == "" {
+			http.NotFound(w, r)
+			return
+		}
+		filePath, ok := safeJoinUnderBase(getMediaDir(), relPath)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
 		serveVideo(w, r, filePath, relPath)
 	})
 	http.HandleFunc("/tv/", func(w http.ResponseWriter, r *http.Request) {
-		relPath := strings.TrimPrefix(r.URL.Path, "/tv/")
-		filePath := filepath.Join(getMediaDir(), relPath)
+		relRaw := strings.TrimPrefix(r.URL.Path, "/tv/")
+		relPath, ok := safeMediaRelPathFromURL(relRaw)
+		if !ok || relPath == "" {
+			http.NotFound(w, r)
+			return
+		}
+		filePath, ok := safeJoinUnderBase(getMediaDir(), relPath)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
 		serveTVStream(w, r, filePath, relPath)
 	})
 
@@ -1112,6 +1131,13 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					relPath = string(b)
 				}
 			}
+			var ok bool
+			relPath, ok = safeMediaRelPath(relPath)
+			if !ok {
+				log.Printf("⚠️ Небезопасный ObjectID path: %q", objID)
+				fmt.Fprintf(w, soapResponse, "", 0, 0, currentBrowseUpdateID())
+				return
+			}
 
 			if payload, count, ok := getBrowseCache(relPath); ok {
 				logOnce("⚡️ КЕШ: /%s (%d)", relPath, count)
@@ -1122,7 +1148,14 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 			dir := getMediaDir()
 			logOnce("📂 ПАПКА: /%s", relPath)
 
-			files, err := os.ReadDir(filepath.Join(dir, relPath))
+			dirPath, ok := safeJoinUnderBase(dir, relPath)
+			if !ok {
+				log.Printf("⚠️ Небезопасный browse path: %q", relPath)
+				fmt.Fprintf(w, soapResponse, "", 0, 0, currentBrowseUpdateID())
+				return
+			}
+
+			files, err := os.ReadDir(dirPath)
 			if err != nil {
 				log.Printf("❌ ОШИБКА ЧТЕНИЯ ПАПКИ: %v", err)
 				fmt.Fprintf(w, soapResponse, "", 0, 0, currentBrowseUpdateID())
@@ -1137,24 +1170,34 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					continue
 				}
 
-				childRelPath := filepath.Join(relPath, f.Name())
-				displayTitle := f.Name()
-				if strings.HasSuffix(strings.ToLower(displayTitle), ".mp4.mp4") {
-					displayTitle = displayTitle[:len(displayTitle)-4]
-				}
-				displayTitle = strings.ReplaceAll(displayTitle, "&", "&amp;")
+				name := f.Name()
+				childRelPath := filepath.Join(relPath, name)
 
 				if f.IsDir() {
+					displayTitle := strings.ReplaceAll(name, "&", "&amp;")
 					childID := base64.RawURLEncoding.EncodeToString([]byte(childRelPath))
 					item := fmt.Sprintf(`&lt;container id="%s" parentID="%s" restricted="1"&gt;&lt;dc:title&gt;%s&lt;/dc:title&gt;&lt;upnp:class&gt;object.container.storageFolder&lt;/upnp:class&gt;&lt;/container&gt;`,
 						childID, objID, displayTitle)
 					items = append(items, item)
 					count++
 				} else {
-					ext := strings.ToLower(filepath.Ext(f.Name()))
+					ext := strings.ToLower(filepath.Ext(name))
 					if ext != ".mp4" && ext != ".mkv" && ext != ".avi" {
 						continue
 					}
+
+					displayTitle := name
+					for {
+						ext := filepath.Ext(displayTitle)
+						switch strings.ToLower(ext) {
+						case ".mp4", ".mkv", ".avi":
+							displayTitle = strings.TrimSuffix(displayTitle, ext)
+						default:
+							goto titleDone
+						}
+					}
+				titleDone:
+					displayTitle = strings.ReplaceAll(displayTitle, "&", "&amp;")
 
 					info, _ := f.Info()
 					fileHash := crc32.ChecksumIEEE([]byte(childRelPath))
@@ -1333,6 +1376,70 @@ func respondJSON(w http.ResponseWriter, status int, payload interface{}) {
 }
 
 // ── Video streaming ───────────────────────────────────────────────────────────
+
+func safeMediaRelPath(rel string) (string, bool) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		return "", true
+	}
+	if strings.Contains(rel, "\x00") {
+		return "", false
+	}
+	rel = strings.TrimPrefix(rel, "/")
+	rel = filepath.ToSlash(rel)
+	for _, seg := range strings.Split(rel, "/") {
+		if seg == ".." {
+			return "", false
+		}
+	}
+
+	clean := path.Clean("/" + rel)
+	clean = strings.TrimPrefix(clean, "/")
+	if clean == "." {
+		return "", true
+	}
+	return clean, true
+}
+
+func safeMediaRelPathFromURL(rel string) (string, bool) {
+	decoded, err := url.PathUnescape(rel)
+	if err != nil {
+		return "", false
+	}
+	return safeMediaRelPath(decoded)
+}
+
+func safeJoinUnderBase(baseDir, rel string) (string, bool) {
+	baseAbs, err := filepath.Abs(baseDir)
+	if err != nil {
+		return "", false
+	}
+
+	targetAbs := baseAbs
+	if rel != "" {
+		targetAbs = filepath.Join(baseAbs, filepath.FromSlash(rel))
+	}
+
+	relToBase, err := filepath.Rel(baseAbs, targetAbs)
+	if err != nil || relToBase == ".." || strings.HasPrefix(relToBase, ".."+string(os.PathSeparator)) {
+		return "", false
+	}
+
+	// Доп. защита от symlink-выхода за пределы базовой папки (если путь существует).
+	baseReal := baseAbs
+	if br, err := filepath.EvalSymlinks(baseAbs); err == nil {
+		baseReal = br
+	}
+	if tr, err := filepath.EvalSymlinks(targetAbs); err == nil {
+		relReal, err := filepath.Rel(baseReal, tr)
+		if err != nil || relReal == ".." || strings.HasPrefix(relReal, ".."+string(os.PathSeparator)) {
+			return "", false
+		}
+		targetAbs = tr
+	}
+
+	return targetAbs, true
+}
 
 func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPath string) {
 	reqID := atomic.AddUint64(&streamSeq, 1)
