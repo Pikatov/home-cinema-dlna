@@ -6,6 +6,8 @@ Home Cinema is a lightweight DLNA/UPnP media server written in Go. It exposes `M
 
 The repository also includes the Home Cinema SwiftUI macOS app: choose a media folder, start or stop the server, open logs, and switch between light and dark themes with a glass-inspired UI.
 
+<img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/be67e61d-b829-4381-9376-9aa1db8acaf9" /><img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/08360764-2e21-460d-94dd-aacd629a8afc" />
+
 ## When it’s useful
 - Your TV or set-top box supports DLNA, but SMB playback is unreliable.
 - You want a simple server without Plex/Jellyfin or a database.
