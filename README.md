@@ -6,6 +6,10 @@ Home Cinema — лёгкий DLNA/UPnP медиасервер на Go для д�
 
 В репозиторий также входит macOS-приложение Home Cinema на SwiftUI: можно выбрать медиатеку, запустить или остановить сервер, открыть логи и переключить светлую или тёмную тему с glass UI.
 
+MacOS App Screenshots:
+
+<img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/be67e61d-b829-4381-9376-9aa1db8acaf9" /><img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/08360764-2e21-460d-94dd-aacd629a8afc" />
+
 ## Когда это полезно
 - ТВ или приставка видит DLNA, но SMB-шара воспроизводится нестабильно.
 - Нужен сервер без Plex/Jellyfin и без отдельной базы данных.
