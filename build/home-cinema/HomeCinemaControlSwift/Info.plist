@@ -5,7 +5,9 @@
     <key>CFBundleIdentifier</key>
     <string>com.homecinema.control</string>
     <key>CFBundleName</key>
-    <string>Home Cinema Control</string>
+    <string>Home Cinema</string>
+    <key>CFBundleDisplayName</key>
+    <string>Home Cinema</string>
     <key>CFBundleExecutable</key>
     <string>HomeCinemaControl</string>
     <key>CFBundlePackageType</key>
@@ -13,9 +15,9 @@
     <key>CFBundleIconFile</key>
     <string>icon.png</string>
     <key>CFBundleVersion</key>
-    <string>1.4</string>
+    <string>1.5</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.4</string>
+    <string>1.5</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSMinimumSystemVersion</key>

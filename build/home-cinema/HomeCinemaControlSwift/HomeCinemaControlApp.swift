@@ -5,7 +5,7 @@ struct HomeCinemaControlApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .frame(minWidth: 520, minHeight: 420)
+                .frame(minWidth: 760, minHeight: 520)
         }
         .windowStyle(.titleBar)
     }

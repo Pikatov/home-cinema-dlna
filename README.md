@@ -1,24 +1,25 @@
-# Home Cinema — DLNA/UPnP медиа‑сервер для домашнего кинотеатра
+# Home Cinema — DLNA/UPnP медиа-сервер для домашнего кинотеатра
 
 [English version →](README.en.md)
 
-Небольшой DLNA/UPnP медиасервер на Go. Поднимает UPnP `MediaServer` + `ContentDirectory`, раздаёт видео по HTTP с поддержкой `Range` (перемотка/продолжение просмотра), запоминает прогресс и может отдавать “TV‑поток” через `ffmpeg`, чтобы убрать фризы на слабом Wi‑Fi.
+Home Cinema — лёгкий DLNA/UPnP медиасервер на Go для домашней сети. Он поднимает `MediaServer` и `ContentDirectory`, раздаёт видео по HTTP с `Range`, сохраняет прогресс просмотра и умеет отдавать альтернативный TV-поток через `ffmpeg`, чтобы уменьшить фризы на слабом Wi‑Fi.
 
-В комплекте есть приложение управления для macOS (SwiftUI): выбрать папку, запустить/остановить сервер, открыть логи.
+В репозиторий также входит macOS-приложение Home Cinema на SwiftUI: можно выбрать медиатеку, запустить или остановить сервер, открыть логи и переключить светлую или тёмную тему с glass UI.
 
 ## Когда это полезно
-- ТВ/приставка видит DLNA, но воспроизведение по SMB/сетевым шарам “подвисает”.
-- Хотите обычную папку с фильмами, без Plex/Jellyfin и без базы данных.
-- Нужно, чтобы перемотка и “продолжить просмотр” работали стабильно.
+- ТВ или приставка видит DLNA, но SMB-шара воспроизводится нестабильно.
+- Нужен сервер без Plex/Jellyfin и без отдельной базы данных.
+- Важно, чтобы перемотка и “продолжить просмотр” переживали рестарты клиента.
 
 ## Возможности
-- DLNA/UPnP: SSDP‑анонс, `desc.xml`, `ContentDirectory:Browse`, HTTP streaming с `Range`.
-- Видео: `.mp4`, `.mkv`, `.avi`.
-- Кеширование результатов Browse (ускоряет навигацию на некоторых ТВ).
-- Прогресс просмотра: сохраняет позицию и показывает таймкод в имени файла (например `Movie.mkv [▶ 12:34]`).
-- Быстрая смена медиатеки: `POST /set-media-dir` (по умолчанию только с `localhost`).
+- DLNA/UPnP: SSDP, `desc.xml`, `ContentDirectory:Browse`, HTTP streaming с `Range`.
+- Видео: `.mp4`, `.mkv`, `.avi`, `.m4v`.
+- Прогресс просмотра с сохранением на диск и восстановлением после перезапуска клиента.
+- Альтернативный TV-поток через `ffmpeg` для более плавного воспроизведения по Wi‑Fi.
+- Кеширование Browse и безопасная смена папки через `POST /set-media-dir`.
+- macOS app со светлой и тёмной темой.
 
-## Быстрый старт (сервер)
+## Быстрый старт
 Требование: Go `1.26+`.
 
 ```bash
@@ -26,83 +27,100 @@ go build -o HomeCinemaServer .
 ./HomeCinemaServer --media-dir "$HOME/Movies" --port 8080
 ```
 
-Дальше на ТВ/приставке откройте список DLNA/медиасерверов и выберите **Home Cinema**.
+На ТВ или приставке выберите сервер **Home Cinema** в списке DLNA-источников.
 
-## Если видео “фризит” по Wi‑Fi
-Опция `--tv-stream` (включена по умолчанию) добавляет альтернативный поток через `ffmpeg`, который ограничивает пики битрейта.
+## Если видео фризит по Wi‑Fi
+Опция `--tv-stream` включена по умолчанию и добавляет альтернативный поток через `ffmpeg`.
 
-- Если `ffmpeg` не установлен, сервер автоматически отключит TV‑поток и напишет предупреждение в лог.
-- Для таймкодов/длительности нужен `ffprobe` (обычно идёт вместе с `ffmpeg`).
+- Если `ffmpeg` не установлен, сервер автоматически отключит TV-поток и напишет предупреждение в лог.
+- Для длительности и таймкодов нужен `ffprobe`.
 
 Пример настройки:
+
 ```bash
 ./HomeCinemaServer --tv-stream=true --tv-maxrate-mbps 8 --tv-bufsize-mbps 16 --tv-crf 23
 ```
 
-## Где хранятся логи и прогресс
-По умолчанию:
-- macOS: `~/Library/Application Support/HomeCinema/` (`server.log`, `progress.json`)
+## Логи и прогресс
+По умолчанию сервер хранит данные в:
 
-Переопределение:
-- переменная окружения `HOMECINEMA_DATA_DIR`
-- или `--data-dir "/путь/к/папке"`
+- macOS: `~/Library/Application Support/HomeCinema/`
+
+Там лежат:
+
+- `server.log`
+- `progress.json`
+
+Папку можно переопределить через `HOMECINEMA_DATA_DIR` или `--data-dir`.
 
 ## Управление и безопасность
-Эндпоинт смены папки (`/set-media-dir`) по умолчанию доступен **только с localhost** — чтобы устройство в локальной сети не могло удалённо переключить медиатеку на произвольный каталог.
+`/set-media-dir` по умолчанию принимает только `POST` и доступен только с `localhost`.
 
 Если осознанно хотите разрешить удалённое управление:
+
 ```bash
 ./HomeCinemaServer --allow-remote-control
 ```
 
 Полезные запросы:
-```bash
-# статус (для localhost — полный путь, из сети — только имя папки)
-curl -s http://127.0.0.1:8080/ | jq
 
-# сменить папку медиатеки (по умолчанию только localhost)
-curl -s -X POST --data-urlencode mediaDir="$HOME/Movies" http://127.0.0.1:8080/set-media-dir | jq
+```bash
+# статус
+curl -s http://127.0.0.1:8080/
+
+# смена папки медиатеки
+curl -s -X POST --data-urlencode mediaDir="$HOME/Movies" http://127.0.0.1:8080/set-media-dir
 ```
 
-## Приложение управления (macOS, SwiftUI)
-<img width="1012" height="564" alt="Home Cinema Control (macOS)" src="https://github.com/user-attachments/assets/1b69e1b5-4241-4d5f-bfe6-9b299cf58dcd" />
+## macOS-приложение
+Сборка `.app`:
 
-Сборка:
 ```bash
-cd build/home-cinema/HomeCinemaControlSwift
-./build.sh
+./build/home-cinema/build_app.sh
 ```
 
-Скрипт собирает универсальный `.app` и вкладывает внутрь свежий бинарь сервера. Логи UI/запуска пишутся в `/tmp/homecinema.log`.
+Запуск приложения:
 
-## Сборка DMG (опционально)
-Скрипт `build/home-cinema/make_dmg.sh` упаковывает `.app` в DMG.
-
-Зависимость:
 ```bash
-brew install create-dmg
+./build/home-cinema/run_control_app.sh
 ```
 
-Сборка:
+Приложение собирает универсальный `.app`, вкладывает внутрь свежий бинарь сервера и использует helper-скрипты для запуска и остановки сервера. При запуске через приложение сервер также хранит логи и прогресс в `~/Library/Application Support/HomeCinema/`.
+
+## Локальная проверка перед git
+В репозитории есть скрипт pre-publish проверки:
+
 ```bash
-./build/home-cinema/make_dmg.sh
+./scripts/prepublish_check.sh
 ```
+
+Он делает три вещи:
+
+- ищет очевидные sensitive-паттерны
+- гоняет `go test ./...`
+- показывает untracked файлы и текущий `git status`
 
 ## Полезные флаги
 - `--media-dir` — папка медиатеки.
-- `--port` — HTTP‑порт сервера (по умолчанию `8080`).
-- `--tv-stream` — включить/выключить TV‑поток (нужен `ffmpeg`).
-- `--tv-stream-first` — поставить TV‑поток первым (ТВ чаще выбирает первый ресурс, но может пропасть прогресс/длительность).
-- `--stream-buf-mb` — буфер выдачи; если сеть “подвисает”, попробуйте `1–2`.
-- `--warmup-meta` / `--warmup-meta-throttle` — прогрев метаданных через `ffprobe` (может грузить диск/CPU).
+- `--port` — HTTP-порт сервера.
+- `--tv-stream` — включить или выключить TV-поток.
+- `--tv-stream-first` — поставить TV-поток первым в DLNA-ресурсах.
+- `--stream-buf-mb` — размер буфера стриминга.
+- `--warmup-meta` и `--warmup-meta-throttle` — прогрев метаданных через `ffprobe`.
 
-Полный список: `./HomeCinemaServer -h`.
+Полный список:
+
+```bash
+./HomeCinemaServer -h
+```
 
 ## Структура проекта
-- `main.go` — DLNA/UPnP сервер.
-- `build/home-cinema/HomeCinemaControlSwift/` — приложение управления (SwiftUI).
-- `build/home-cinema/make_dmg.sh` — упаковка DMG.
+- `app.go`, `browse.go`, `streaming.go`, `progress.go`, `metadata.go` и соседние файлы — серверная логика.
+- `build/home-cinema/HomeCinemaControlSwift/` — SwiftUI macOS app Home Cinema.
+- `build/home-cinema/build_app.sh` — сборка `.app`.
+- `build/home-cinema/run_control_app.sh` — запуск `.app`.
+- `scripts/prepublish_check.sh` — локальная проверка перед публикацией.
 
 ## Лицензия и изменения
-- Лицензия: MIT (`LICENSE`)
-- История изменений: `CHANGELOG.md`
+- MIT — [LICENSE](LICENSE)
+- История изменений — [CHANGELOG.md](CHANGELOG.md)

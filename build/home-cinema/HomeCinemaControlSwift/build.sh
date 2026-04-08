@@ -1,13 +1,20 @@
 #!/bin/bash
 set -euo pipefail
-APP_NAME="Home Cinema Control"
+APP_NAME="Home Cinema"
 BIN_NAME=HomeCinemaControl
 SRC_DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$SRC_DIR/../../.." && pwd)
 APP_DIR="$SRC_DIR/${APP_NAME}.app"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
+SCRIPTS_DIR="$RES_DIR/scripts"
 PLIST_SRC="$SRC_DIR/Info.plist"
-SWIFT_FILES=($SRC_DIR/HomeCinemaControlApp.swift $SRC_DIR/ContentView.swift)
+SWIFT_FILES=(
+  "$SRC_DIR/AppTheme.swift"
+  "$SRC_DIR/ServerController.swift"
+  "$SRC_DIR/ContentView.swift"
+  "$SRC_DIR/HomeCinemaControlApp.swift"
+)
 SDK=$(xcrun --show-sdk-path --sdk macosx)
 export SWIFT_MODULE_CACHE_PATH="$SRC_DIR/.swift-module-cache"
 mkdir -p "$SWIFT_MODULE_CACHE_PATH"
@@ -18,9 +25,14 @@ mkdir -p "$CLANG_MODULE_CACHE_PATH"
 
 # Sandbox-friendly Go caches (avoid ~/Library/Caches and ~/go outside workspace)
 export GOCACHE="$SRC_DIR/.go-build-cache"
-export GOPATH="$SRC_DIR/.go"
-export GOMODCACHE="$GOPATH/pkg/mod"
-mkdir -p "$GOCACHE" "$GOMODCACHE"
+mkdir -p "$GOCACHE"
+if [ -d "$HOME/go/pkg/mod" ]; then
+  export GOMODCACHE="$HOME/go/pkg/mod"
+else
+  export GOPATH="$SRC_DIR/.go"
+  export GOMODCACHE="$GOPATH/pkg/mod"
+  mkdir -p "$GOMODCACHE"
+fi
 
 # Targets
 SWIFT_TARGET_ARM64="arm64-apple-macos12"
@@ -31,14 +43,13 @@ ICON_SRC="$SRC_DIR/icon.png"
 
 # Build server binary (arm64 macOS) next to this script
 echo "Building server binary (universal)..."
-SERVER_SRC="$SRC_DIR/../../../main.go"
-GOOS=darwin GOARCH=arm64 go build -o "$SRC_DIR/../HomeCinemaServer-arm64" "$SERVER_SRC"
-GOOS=darwin GOARCH=amd64 go build -o "$SRC_DIR/../HomeCinemaServer-x86_64" "$SERVER_SRC"
+GOOS=darwin GOARCH=arm64 go build -o "$SRC_DIR/../HomeCinemaServer-arm64" "$REPO_ROOT"
+GOOS=darwin GOARCH=amd64 go build -o "$SRC_DIR/../HomeCinemaServer-x86_64" "$REPO_ROOT"
 lipo -create -output "$SRC_DIR/../HomeCinemaServer" "$SRC_DIR/../HomeCinemaServer-arm64" "$SRC_DIR/../HomeCinemaServer-x86_64"
 rm -f "$SRC_DIR/../HomeCinemaServer-arm64" "$SRC_DIR/../HomeCinemaServer-x86_64"
 
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS_DIR" "$RES_DIR"
+mkdir -p "$MACOS_DIR" "$RES_DIR" "$SCRIPTS_DIR"
 cp "$PLIST_SRC" "$APP_DIR/Contents/Info.plist"
 
 # Bundle the source PNG icon (used as app icon via Info.plist)
@@ -73,9 +84,11 @@ rm -f "$MACOS_DIR/$BIN_NAME-arm64" "$MACOS_DIR/$BIN_NAME-x86_64"
 
 # Embed server binary into the app bundle
 cp "$SRC_DIR/../HomeCinemaServer" "$MACOS_DIR/HomeCinemaServer"
+cp "$SRC_DIR/scripts/"*.sh "$SCRIPTS_DIR/"
 
 chmod +x "$MACOS_DIR/$BIN_NAME"
 chmod +x "$MACOS_DIR/HomeCinemaServer"
+chmod +x "$SCRIPTS_DIR/"*.sh
 if command -v codesign >/dev/null 2>&1; then
   codesign --force --deep --sign - "$APP_DIR"
 fi
