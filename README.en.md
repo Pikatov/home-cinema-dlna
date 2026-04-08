@@ -102,6 +102,20 @@ It does three things:
 - runs `go test ./...`
 - prints untracked files and current `git status`
 
+## Tests
+The repository includes unit tests for the core server logic:
+
+- XML escaping
+- safe path normalization and joining
+- `Range` parsing
+- watch progress save/load behavior
+
+Run them manually with:
+
+```bash
+go test ./...
+```
+
 ## Handy flags
 - `--media-dir` — media library folder.
 - `--port` — HTTP port.
