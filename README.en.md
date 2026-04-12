@@ -8,7 +8,8 @@ The current release prepared in this repository is **1.6**.
 
 MacOS App Screenshots:
 
-<img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/be67e61d-b829-4381-9376-9aa1db8acaf9" /><img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/08360764-2e21-460d-94dd-aacd629a8afc" />
+<img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/e96ee4d6-037e-4f92-be10-5b735517818b" />
+<img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/889d9e19-3458-49cc-a9a8-c95af7997a82" />
 
 ## What the project does well
 - Exposes a DLNA/UPnP `MediaServer` and `ContentDirectory`.
