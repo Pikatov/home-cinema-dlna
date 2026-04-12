@@ -1,25 +1,28 @@
-# Home Cinema — DLNA/UPnP media server for your home network
+# Home Cinema
 
 [Русская версия →](README.md)
 
-Home Cinema is a lightweight DLNA/UPnP media server written in Go. It exposes `MediaServer` and `ContentDirectory`, streams video over HTTP with `Range`, stores watch progress on disk, and can provide an alternative TV stream via `ffmpeg` to reduce stuttering on weak Wi‑Fi.
+Home Cinema is a small Go-based DLNA/UPnP server with a companion macOS control app. If you just want to point your TV at a folder of movies without bringing in Plex, Jellyfin, a database, or a full media stack, this project is built for that workflow.
 
-The repository also includes the Home Cinema SwiftUI macOS app: choose a media folder, start or stop the server, open logs, and switch between light and dark themes with a glass-inspired UI.
+The current release prepared in this repository is **1.6**.
+
+MacOS App Screenshots:
 
 <img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/be67e61d-b829-4381-9376-9aa1db8acaf9" /><img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/08360764-2e21-460d-94dd-aacd629a8afc" />
 
-## When it’s useful
-- Your TV or set-top box supports DLNA, but SMB playback is unreliable.
-- You want a simple server without Plex/Jellyfin or a database.
-- You want seek and resume to survive client restarts.
+## What the project does well
+- Exposes a DLNA/UPnP `MediaServer` and `ContentDirectory`.
+- Streams video over HTTP with `Range`, so seek and resume behave the way DLNA clients expect.
+- Stores watch progress on disk and survives client or server restarts.
+- Can start a movie directly from the saved watch position when progress already exists.
+- Lets you inspect, reset, and remove individual progress entries from the macOS app.
+- Can generate an alternative TV stream through `ffmpeg` when direct playback over Wi‑Fi is shaky.
+- Provides local control endpoints for changing the media folder and managing saved progress.
 
-## Features
-- DLNA/UPnP: SSDP, `desc.xml`, `ContentDirectory:Browse`, HTTP streaming with `Range`.
-- Video: `.mp4`, `.mkv`, `.avi`, `.m4v`.
-- On-disk watch progress that survives client restarts.
-- Optional `ffmpeg` TV stream to smooth bitrate spikes on Wi‑Fi.
-- Browse caching and safe media folder switching via `POST /set-media-dir`.
-- macOS app with light and dark themes.
+## When it makes sense
+- Your TV or set-top box supports DLNA, but SMB playback is unreliable.
+- You want something much lighter than a full media platform.
+- You care about “resume where I left off” more than posters, indexing, and library metadata.
 
 ## Quick start
 Requirement: Go `1.26+`.
@@ -29,36 +32,50 @@ go build -o HomeCinemaServer .
 ./HomeCinemaServer --media-dir "$HOME/Movies" --port 8080
 ```
 
-Then select **Home Cinema** from the DLNA source list on your TV or set-top box.
+Then pick **Home Cinema** from the DLNA source list on your TV or set-top box.
 
 ## If playback stutters on Wi‑Fi
-`--tv-stream` is enabled by default and adds an alternative stream through `ffmpeg`.
+`--tv-stream` is enabled by default. The server can add an `ffmpeg`-based alternative stream, and for heavier files it can even move that stream higher in the resource order so clients are more likely to choose the smoother option.
 
-- If `ffmpeg` is missing, the server disables the TV stream automatically and logs a warning.
-- `ffprobe` is recommended for durations and timecodes.
+- If `ffmpeg` is missing, the server disables that extra stream automatically and logs a warning.
+- `ffprobe` is recommended for duration and timecode handling.
 
 Example tuning:
 
 ```bash
-./HomeCinemaServer --tv-stream=true --tv-maxrate-mbps 8 --tv-bufsize-mbps 16 --tv-crf 23
+./HomeCinemaServer \
+  --tv-stream=true \
+  --tv-auto-first=true \
+  --tv-auto-first-mbps 18 \
+  --tv-maxrate-mbps 8 \
+  --tv-bufsize-mbps 16 \
+  --tv-crf 23
 ```
 
-## Logs and progress
-By default the server stores data in:
+## Logs and watch progress
+By default the server stores its state in:
 
 - macOS: `~/Library/Application Support/HomeCinema/`
 
-This directory contains:
+The main files are:
 
 - `server.log`
 - `progress.json`
 
-You can override it with `HOMECINEMA_DATA_DIR` or `--data-dir`.
+You can override the location with `HOMECINEMA_DATA_DIR` or `--data-dir`.
+
+Starting with `1.6`, the app also cleans up stale progress entries for files that no longer exist in the current media library, so deleted movies stop reappearing in the UI.
+
+When a movie already has saved progress, the server may prefer the resource that lets the TV start directly from that point. That makes "resume playback" much more reliable, but it comes with a clear limitation: after such a start, many DLNA clients can no longer seek properly and may stop showing the remaining playback time. At the moment this is an intentional tradeoff in favor of dependable resume behavior on TVs.
 
 ## Control and security
-`/set-media-dir` accepts `POST` only and is localhost-only by default.
+The control endpoints are localhost-only by default:
 
-To allow remote control explicitly:
+- `POST /set-media-dir`
+- `POST /reset-progress`
+- `POST /delete-progress`
+
+If you intentionally want remote control:
 
 ```bash
 ./HomeCinemaServer --allow-remote-control
@@ -81,34 +98,34 @@ Build the `.app`:
 ./build/home-cinema/build_app.sh
 ```
 
-Launch the app:
+Launch it:
 
 ```bash
 ./build/home-cinema/run_control_app.sh
 ```
 
-The app builds a universal `.app`, bundles a fresh server binary, and uses helper scripts to start and stop the server. When started from the app, the server still stores logs and progress in `~/Library/Application Support/HomeCinema/`.
+The build script creates a universal `Home Cinema.app`, bundles a fresh server binary, and wires in the helper scripts used to start and stop the service. In `1.6`, the UI was simplified substantially: fewer repeated status labels, a clearer `Reset Progress` action, a compact saved-progress panel, and inline removal for individual items.
 
-## Local pre-publish check
-The repository includes a pre-publish verification script:
+## Local pre-release check
+The repository includes a small pre-publish verification script:
 
 ```bash
 ./scripts/prepublish_check.sh
 ```
 
-It does three things:
+It:
 
 - scans for obvious sensitive patterns
 - runs `go test ./...`
-- prints untracked files and current `git status`
+- prints untracked files and the current `git status`
 
 ## Tests
-The repository includes unit tests for the core server logic:
+The repository has unit tests around the core server behavior:
 
 - XML escaping
 - safe path normalization and joining
 - `Range` parsing
-- watch progress save/load behavior
+- watch progress persistence
 
 Run them manually with:
 
@@ -116,27 +133,17 @@ Run them manually with:
 go test ./...
 ```
 
-## Handy flags
-- `--media-dir` — media library folder.
-- `--port` — HTTP port.
-- `--tv-stream` — enable or disable the TV stream.
-- `--tv-stream-first` — put the TV stream first in DLNA resources.
-- `--stream-buf-mb` — streaming buffer size.
-- `--warmup-meta` and `--warmup-meta-throttle` — metadata warmup via `ffprobe`.
-
-Full list:
-
-```bash
-./HomeCinemaServer -h
-```
-
 ## Project layout
-- `app.go`, `browse.go`, `streaming.go`, `progress.go`, `metadata.go` and related files — server logic.
-- `build/home-cinema/HomeCinemaControlSwift/` — SwiftUI macOS app Home Cinema.
-- `build/home-cinema/build_app.sh` — `.app` build script.
-- `build/home-cinema/run_control_app.sh` — `.app` launcher script.
-- `scripts/prepublish_check.sh` — local pre-publish verification.
+- `app.go`, `browse.go`, `streaming.go`, `progress.go`, `metadata.go`, and related files — server-side logic.
+- `build/home-cinema/HomeCinemaControlSwift/` — macOS app bundle resources and build scripts.
+- `build/home-cinema/HomeCinemaControlSwift/Sources/HomeCinemaControlSwift/` — current SwiftUI sources for the control app.
+- `build/home-cinema/build_app.sh` — `.app` build entrypoint.
+- `build/home-cinema/run_control_app.sh` — app launcher script.
+- `scripts/prepublish_check.sh` — local verification before publishing.
 
-## License and changes
-- MIT — [LICENSE](LICENSE)
+## Docs
 - Change history — [CHANGELOG.md](CHANGELOG.md)
+- Release notes for `1.6` — [releases/v1.6.en.md](releases/v1.6.en.md)
+- Russian release notes for `1.6` — [releases/v1.6.md](releases/v1.6.md)
+- Security policy — [SECURITY.md](SECURITY.md)
+- License — [LICENSE](LICENSE)

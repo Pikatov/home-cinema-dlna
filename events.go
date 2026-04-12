@@ -23,10 +23,12 @@ var (
 	eventSubs   = make(map[string]*upnpEventSub)
 )
 
+var eventHTTPClient = &http.Client{Timeout: 2 * time.Second}
+
 func newSID() string {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return sprintf("uuid:%d", time.Now().UnixNano())
+		return fmt.Sprintf("uuid:%d", time.Now().UnixNano())
 	}
 	return "uuid:" + hex.EncodeToString(b[:])
 }
@@ -75,7 +77,6 @@ func notifyContentDirectory(updateID uint32) {
 		`  <e:property><SystemUpdateID>%d</SystemUpdateID></e:property>`+"\n"+
 		`</e:propertyset>`, updateID)
 
-	client := &http.Client{Timeout: 2 * time.Second}
 	for _, t := range targets {
 		req, err := http.NewRequest("NOTIFY", t.callback, strings.NewReader(body))
 		if err != nil {
@@ -86,7 +87,7 @@ func notifyContentDirectory(updateID uint32) {
 		req.Header.Set("NTS", "upnp:propchange")
 		req.Header.Set("SID", t.sid)
 		req.Header.Set("SEQ", strconv.FormatUint(uint64(t.seq), 10))
-		_, _ = client.Do(req)
+		_, _ = eventHTTPClient.Do(req)
 	}
 }
 

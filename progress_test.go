@@ -74,3 +74,29 @@ func TestProgressStoreDropsOldEntriesOnLoad(t *testing.T) {
 		t.Fatal("expected old progress to be deleted")
 	}
 }
+
+func TestProgressStoreSummaryAndClearAll(t *testing.T) {
+	ps := newProgressStore(filepath.Join(t.TempDir(), "progress.json"))
+	now := time.Now()
+
+	ps.mu.Lock()
+	ps.data["movie-1"] = progressEntry{Seconds: 120, Updated: now.Add(-time.Minute)}
+	ps.data["movie-2"] = progressEntry{Seconds: 240, Updated: now}
+	ps.mu.Unlock()
+
+	summary := ps.Summary()
+	if summary.Count != 2 {
+		t.Fatalf("summary.Count = %d, want 2", summary.Count)
+	}
+	if !summary.LastUpdated.Equal(now) {
+		t.Fatalf("summary.LastUpdated = %v, want %v", summary.LastUpdated, now)
+	}
+
+	cleared := ps.ClearAll()
+	if cleared != 2 {
+		t.Fatalf("cleared = %d, want 2", cleared)
+	}
+	if summary = ps.Summary(); summary.Count != 0 {
+		t.Fatalf("summary.Count after clear = %d, want 0", summary.Count)
+	}
+}

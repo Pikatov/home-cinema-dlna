@@ -98,6 +98,14 @@ func getVideoMetaCached(filePath string) (videoMeta, bool) {
 	return m, ok
 }
 
+// clearMetaCache drops all cached durations. Call when the media directory changes
+// so stale entries from the old directory do not bleed into the new one.
+func clearMetaCache() {
+	metaCacheMu.Lock()
+	metaCache = make(map[string]videoMeta)
+	metaCacheMu.Unlock()
+}
+
 func warmVideoMetaAsync(filePath string) {
 	if filePath == "" {
 		return
@@ -213,7 +221,10 @@ func warmupMetaCache(dir string) {
 				select {
 				case <-ctx.Done():
 					return errStop
-				case <-time.After(500 * time.Millisecond):
+				case <-streamIdleC:
+					// a stream ended; re-check at top of loop
+				case <-time.After(5 * time.Second):
+					// safety fallback in case signal was missed
 				}
 			}
 			getVideoMeta(path)

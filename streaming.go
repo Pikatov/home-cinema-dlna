@@ -2,10 +2,13 @@ package main
 
 import (
 	"bufio"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -29,7 +33,7 @@ func formatDLNADuration(seconds float64) string {
 	if h > 99 {
 		h = 99
 	}
-	return sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
 }
 
 func setDLNATimeSeekHeaders(w http.ResponseWriter, durationSeconds float64) {
@@ -41,8 +45,8 @@ func setDLNATimeSeekHeaders(w http.ResponseWriter, durationSeconds float64) {
 		return
 	}
 	w.Header().Set("Content-Duration", dur)
-	w.Header().Set("TimeSeekRange.dlna.org", sprintf("npt=00:00:00.000-%s/%s", dur, dur))
-	w.Header().Set("X-Seek-Range", sprintf("npt=0-%.0f", durationSeconds))
+	w.Header().Set("TimeSeekRange.dlna.org", fmt.Sprintf("npt=00:00:00.000-%s/%s", dur, dur))
+	w.Header().Set("X-Seek-Range", fmt.Sprintf("npt=0-%.0f", durationSeconds))
 }
 
 var streamBufSize = 4 * 1024 * 1024
@@ -55,10 +59,25 @@ var streamBufPool = sync.Pool{
 
 var progressUpdateEvery = 3 * time.Second
 
+// streamIdleC receives a token whenever activeStreamRequests drops to zero.
+var streamIdleC = make(chan struct{}, 1)
+
+func notifyStreamIdle() {
+	if atomic.LoadInt64(&activeStreamRequests) == 0 {
+		select {
+		case streamIdleC <- struct{}{}:
+		default:
+		}
+	}
+}
+
 func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPath string) {
 	reqID := atomic.AddUint64(&streamSeq, 1)
 	active := atomic.AddInt64(&activeStreamRequests, 1)
-	defer atomic.AddInt64(&activeStreamRequests, -1)
+	defer func() {
+		atomic.AddInt64(&activeStreamRequests, -1)
+		notifyStreamIdle()
+	}()
 
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -99,7 +118,7 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 		if streamDebugEnabled {
 			extra := ""
 			if streamDebugHeaders {
-				extra = sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
+				extra = fmt.Sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
 					r.Header.Get("transferMode.dlna.org"),
 					r.Header.Get("GetContentFeatures.dlna.org"),
 					r.Header.Get("TimeSeekRange.dlna.org"),
@@ -118,11 +137,11 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 
 	start, end, ok := parseRange(rangeHdr, info.Size())
 	if !ok {
-		w.Header().Set("Content-Range", sprintf("bytes */%d", info.Size()))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
 		if streamDebugEnabled {
 			extra := ""
 			if streamDebugHeaders {
-				extra = sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
+				extra = fmt.Sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
 					r.Header.Get("transferMode.dlna.org"),
 					r.Header.Get("GetContentFeatures.dlna.org"),
 					r.Header.Get("TimeSeekRange.dlna.org"),
@@ -136,7 +155,7 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 	}
 
 	length := end - start + 1
-	w.Header().Set("Content-Range", sprintf("bytes %d-%d/%d", start, end, info.Size()))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, info.Size()))
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusPartialContent)
 
@@ -148,7 +167,7 @@ func serveVideo(w http.ResponseWriter, r *http.Request, filePath, requestedRelPa
 	if streamDebugEnabled {
 		extra := ""
 		if streamDebugHeaders {
-			extra = sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
+			extra = fmt.Sprintf(" hdr{transfer=%q getfeat=%q timeseek=%q conn=%q}",
 				r.Header.Get("transferMode.dlna.org"),
 				r.Header.Get("GetContentFeatures.dlna.org"),
 				r.Header.Get("TimeSeekRange.dlna.org"),
@@ -196,11 +215,11 @@ func streamFile(w http.ResponseWriter, r *http.Request, file *os.File, reqID uin
 			}
 			errStr := ""
 			if endErr != nil {
-				errStr = sprintf(" err=%q", endErr.Error())
+				errStr = fmt.Sprintf(" err=%q", endErr.Error())
 			}
 			minStr := "n/a"
 			if chunkCount > 0 && minChunkMbps != math.Inf(1) {
-				minStr = sprintf("%.2f", minChunkMbps)
+				minStr = fmt.Sprintf("%.2f", minChunkMbps)
 			}
 			log.Printf("DBG stream#%d done file=%q sent=%d dur=%s avg_mbps=%.2f reason=%s%s", reqID, requestedRelPath, sent, dur.Round(time.Millisecond), mbps, endReason, errStr)
 			log.Printf("DBG stream#%d stats file=%q chunks=%d min_chunk_mbps=%s max_chunk_mbps=%.2f buf=%d", reqID, requestedRelPath, chunkCount, minStr, maxChunkMbps, len(buf))
@@ -314,10 +333,23 @@ func streamFile(w http.ResponseWriter, r *http.Request, file *os.File, reqID uin
 	endReason = "finished"
 }
 
+// isClientClosed reports whether err is a normal client-disconnect error
+// (broken pipe, connection reset, etc.).
 func isClientClosed(err error) bool {
 	if err == nil {
 		return false
 	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		var syscallErr *os.SyscallError
+		if errors.As(opErr.Err, &syscallErr) {
+			switch syscallErr.Err {
+			case syscall.EPIPE, syscall.ECONNRESET, syscall.ENOTCONN:
+				return true
+			}
+		}
+	}
+	// Fallback for edge cases (TLS, HTTP/2, platform variants).
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "broken pipe") ||
 		strings.Contains(s, "reset by peer") ||
@@ -345,6 +377,8 @@ func detectContentType(path string) (string, string) {
 		return "video/x-matroska", "DLNA.ORG_PN=MATROSKA;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 	case ".avi":
 		return "video/x-msvideo", "DLNA.ORG_PN=AVI;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+	case ".mov":
+		return "video/quicktime", "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 	default:
 		if m := mime.TypeByExtension(ext); m != "" {
 			return m, "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
@@ -385,20 +419,63 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 	}
 	progressKey := progressKeyFromRelPath(requestedRelPath)
 
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	fileSize := fi.Size()
+
 	w.Header().Set("Content-Type", tvContentType)
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("transferMode.dlna.org", "Streaming")
 	w.Header().Set("TransferMode.dlna.org", "Streaming")
 	w.Header().Set("contentFeatures.dlna.org", tvDLNAFeatures)
 	w.Header().Set("ContentFeatures.dlna.org", tvDLNAFeatures)
 	w.Header().Set("Cache-Control", "no-transform")
+	if meta.DurationSeconds > 0 {
+		w.Header().Set("X-Content-Duration", fmt.Sprintf("%.3f", meta.DurationSeconds))
+		w.Header().Set("Content-Duration", fmt.Sprintf("%.3f", meta.DurationSeconds))
+	}
 
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	if r.Header.Get("Range") != "" {
-		logOnce("⚠️ TV stream: игнор Range для %s", requestedRelPath)
+	// Determine seek position: from saved progress (initial play) or byte-range seek.
+	var seekSecs float64
+	rangeHdr := r.Header.Get("Range")
+
+	var startByte int64
+	if rangeHdr != "" && rangeHdr != "bytes=0-" && strings.HasPrefix(rangeHdr, "bytes=") {
+		startStr, _, _ := strings.Cut(strings.TrimPrefix(rangeHdr, "bytes="), "-")
+		startByte, _ = strconv.ParseInt(startStr, 10, 64)
+	}
+
+	if startByte > 0 {
+		// User seeked: convert byte offset → time. Requires known duration and file size.
+		if meta.DurationSeconds > 0 && fileSize > 0 {
+			seekSecs = meta.DurationSeconds * float64(startByte) / float64(fileSize)
+			log.Printf("⏩ TV SEEK: %s → %.0f сек (байт %d)", requestedRelPath, seekSecs, startByte)
+		}
+		// Respond 206 so the TV accepts the seek.
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, fileSize-1, fileSize))
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		// Initial start (no Range, or bytes=0-): check for saved resume position.
+		if entry, ok := getProgressEntry(progressKey); ok {
+			if entry.Seconds > 0 {
+				seekSecs = entry.Seconds
+			} else if entry.Position > 0 && entry.Size > 0 && entry.DurationSeconds > 0 {
+				if fi2, err2 := os.Stat(filePath); err2 == nil && fi2.Size() == entry.Size {
+					seekSecs = entry.DurationSeconds * float64(entry.Position) / float64(entry.Size)
+				}
+			}
+			if seekSecs > 0 {
+				log.Printf("▶️ TV RESUME: %s от %.0f сек", requestedRelPath, seekSecs)
+			}
+		}
 	}
 
 	args := []string{
@@ -406,6 +483,12 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 		"-loglevel", "error",
 		"-analyzeduration", "200000",
 		"-probesize", "65536",
+	}
+	if seekSecs > 0 {
+		// -ss before -i = fast input seek (keyframe-accurate)
+		args = append(args, "-ss", fmt.Sprintf("%.3f", seekSecs))
+	}
+	outputArgs := []string{
 		"-i", filePath,
 		"-map", "0:v:0",
 		"-map", "0:a:0?",
@@ -419,10 +502,10 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 		"-bf", "0",
 		"-pix_fmt", "yuv420p",
 		"-crf", strconv.Itoa(tvVideoCRF),
-		"-maxrate", sprintf("%dM", tvVideoMaxrateMb),
-		"-bufsize", sprintf("%dM", tvVideoBufsizeMb),
+		"-maxrate", fmt.Sprintf("%dM", tvVideoMaxrateMb),
+		"-bufsize", fmt.Sprintf("%dM", tvVideoBufsizeMb),
 		"-c:a", "aac",
-		"-b:a", sprintf("%dk", tvAudioKbps),
+		"-b:a", fmt.Sprintf("%dk", tvAudioKbps),
 		"-ac", strconv.Itoa(tvAudioChannels),
 		"-ar", "48000",
 		"-f", "mpegts",
@@ -431,8 +514,13 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 		"-max_interleave_delta", "0",
 		"-muxdelay", "0",
 		"-muxpreload", "0",
-		"pipe:1",
 	}
+	if seekSecs > 0 {
+		// Offset output timestamps so TV's progress bar shows correct position.
+		outputArgs = append(outputArgs, "-output_ts_offset", fmt.Sprintf("%.3f", seekSecs))
+	}
+	outputArgs = append(outputArgs, "pipe:1")
+	args = append(args, outputArgs...)
 
 	t0 := time.Now()
 	cmd := exec.CommandContext(r.Context(), ffmpegExe, args...)
@@ -506,6 +594,51 @@ loop:
 	elapsed := time.Since(started).Seconds()
 	recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
 	_ = cmd.Wait()
+}
+
+// serveResume serves the file starting from the saved progress position.
+// When the TV requests /resume/ without a Range header, we synthesise one
+// from the stored byte offset (or seconds → bytes). If no progress is found
+// we fall through to a normal serveVideo call.
+func serveResume(w http.ResponseWriter, r *http.Request, filePath, requestedRelPath string) {
+	key := progressKeyFromRelPath(requestedRelPath)
+	entry, ok := getProgressEntry(key)
+	if !ok {
+		serveVideo(w, r, filePath, requestedRelPath)
+		return
+	}
+
+	var startPos int64
+
+	// Prefer byte-accurate position; verify file size matches to avoid wrong offset.
+	if entry.Position > 0 && entry.Size > 0 {
+		if info, err := os.Stat(filePath); err == nil && info.Size() == entry.Size {
+			startPos = entry.Position
+		}
+	}
+
+	// Fallback: convert elapsed seconds to bytes using duration ratio.
+	if startPos <= 0 && entry.Seconds > 0 && entry.DurationSeconds > 0 {
+		if info, err := os.Stat(filePath); err == nil && info.Size() > 0 {
+			startPos = int64(float64(info.Size()) * entry.Seconds / entry.DurationSeconds)
+		}
+	}
+
+	if startPos <= 0 {
+		serveVideo(w, r, filePath, requestedRelPath)
+		return
+	}
+
+	// Only synthesise the Range on the initial (no-Range) request.
+	// Subsequent Range requests from the TV (seeking) are passed through as-is.
+	if r.Header.Get("Range") == "" {
+		r2 := r.Clone(r.Context())
+		r2.Header.Set("Range", fmt.Sprintf("bytes=%d-", startPos))
+		log.Printf("▶️ RESUME: %s от байта %d", requestedRelPath, startPos)
+		serveVideo(w, r2, filePath, requestedRelPath)
+		return
+	}
+	serveVideo(w, r, filePath, requestedRelPath)
 }
 
 func parseRange(h string, size int64) (start, end int64, ok bool) {

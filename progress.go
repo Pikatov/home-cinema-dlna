@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,6 +27,11 @@ type progressStore struct {
 	doneCh    chan struct{}
 	startOnce sync.Once
 	closeOnce sync.Once
+}
+
+type progressSummary struct {
+	Count       int
+	LastUpdated time.Time
 }
 
 var progressStoreRef = newProgressStore(progressFile)
@@ -300,6 +306,55 @@ func (ps *progressStore) GetEntry(key string) (progressEntry, bool) {
 	return entry, ok
 }
 
+func (ps *progressStore) Summary() progressSummary {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	summary := progressSummary{
+		Count: len(ps.data),
+	}
+	for _, entry := range ps.data {
+		if entry.Updated.After(summary.LastUpdated) {
+			summary.LastUpdated = entry.Updated
+		}
+	}
+	return summary
+}
+
+func (ps *progressStore) ClearAll() int {
+	ps.mu.Lock()
+	removed := len(ps.data)
+	if removed > 0 {
+		ps.data = make(map[string]progressEntry)
+	}
+	ps.mu.Unlock()
+
+	if removed > 0 {
+		ps.RequestSave()
+		invalidateBrowseCache()
+	}
+	return removed
+}
+
+func (ps *progressStore) Delete(key string) bool {
+	if key == "" {
+		return false
+	}
+
+	ps.mu.Lock()
+	_, ok := ps.data[key]
+	if ok {
+		delete(ps.data, key)
+	}
+	ps.mu.Unlock()
+
+	if ok {
+		ps.RequestSave()
+		invalidateBrowseCache()
+	}
+	return ok
+}
+
 func shouldPersistByteProgress(position, size int64, durationSeconds float64) bool {
 	if size <= 0 || position <= 0 || position >= size {
 		return false
@@ -415,6 +470,27 @@ func getProgressEntry(key string) (progressEntry, bool) {
 	return progressStoreRef.GetEntry(key)
 }
 
+func getProgressSummary() progressSummary {
+	if progressStoreRef == nil {
+		return progressSummary{}
+	}
+	return progressStoreRef.Summary()
+}
+
+func clearAllProgress() int {
+	if progressStoreRef == nil {
+		return 0
+	}
+	return progressStoreRef.ClearAll()
+}
+
+func deleteProgress(key string) bool {
+	if progressStoreRef == nil {
+		return false
+	}
+	return progressStoreRef.Delete(key)
+}
+
 func formatTimecode(pos, size int64, durationSecs float64) string {
 	if durationSecs <= 0 || size <= 0 {
 		return ""
@@ -424,9 +500,9 @@ func formatTimecode(pos, size int64, durationSecs float64) string {
 	m := (int(secs) % 3600) / 60
 	s := int(secs) % 60
 	if h > 0 {
-		return sprintf("%d:%02d:%02d", h, m, s)
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
-	return sprintf("%d:%02d", m, s)
+	return fmt.Sprintf("%d:%02d", m, s)
 }
 
 func formatSecondsTimecode(seconds float64) string {
@@ -438,9 +514,9 @@ func formatSecondsTimecode(seconds float64) string {
 	m := (total % 3600) / 60
 	s := total % 60
 	if h > 0 {
-		return sprintf("%d:%02d:%02d", h, m, s)
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
-	return sprintf("%d:%02d", m, s)
+	return fmt.Sprintf("%d:%02d", m, s)
 }
 
 func progressKeyFromRelPath(rel string) string {

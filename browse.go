@@ -15,8 +15,29 @@ import (
 	"time"
 )
 
+func averageBitrateMbps(size int64, durationSeconds float64) float64 {
+	if size <= 0 || durationSeconds <= 0 {
+		return 0
+	}
+	return (float64(size) * 8) / durationSeconds / 1e6
+}
+
+func shouldPreferTVResource(path string, size int64, durationSeconds float64) bool {
+	if !tvStreamEnabled {
+		return false
+	}
+	if tvStreamFirst {
+		return true
+	}
+	if !tvAutoFirst || durationSeconds <= 0 {
+		return false
+	}
+	return averageBitrateMbps(size, durationSeconds) >= float64(tvAutoFirstMbps)
+}
+
 func handleContentDirectory(ip string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 		body, _ := io.ReadAll(r.Body)
 		bodyStr := string(body)
 
@@ -142,8 +163,13 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					warmVideoMetaAsync(fullPath)
 				}
 			}
-			if tc := getProgressTimecode(childRelPath, info.Size(), meta.DurationSeconds); tc != "" {
-				title = fmt.Sprintf("%s [▶ %s]", displayTitle, tc)
+			tc := getProgressTimecode(childRelPath, info.Size(), meta.DurationSeconds)
+			if tc != "" {
+				if dur := formatSecondsTimecode(meta.DurationSeconds); dur != "" {
+					title = fmt.Sprintf("%s [▶ %s - %s]", displayTitle, tc, dur)
+				} else {
+					title = fmt.Sprintf("%s [▶ %s]", displayTitle, tc)
+				}
 			}
 
 			durationAttr := ""
@@ -165,7 +191,10 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					escapeXMLAttr(proto),
 					escapeXMLText(fileURL),
 				)
-				if tvStreamFirst {
+				// Put TV stream first if: forced by flag/bitrate, OR has saved progress
+				// (so the TV picks it and ffmpeg -ss handles resume correctly).
+				// Without progress, direct file goes first → seeking and duration work.
+				if shouldPreferTVResource(fullPath, info.Size(), meta.DurationSeconds) || tc != "" {
 					resParts = append(resParts, tvRes, fileRes)
 				} else {
 					resParts = append(resParts, fileRes, tvRes)

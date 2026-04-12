@@ -5,8 +5,12 @@ build/home-cinema/dmg-staging/
 build/home-cinema/media_dir.txt
 build/home-cinema/HomeCinemaControl.app/
 build/home-cinema/HomeCinemaControlSwift/Home Cinema Control.app/
+build/home-cinema/HomeCinemaControlSwift/Home Cinema.app/
 build/home-cinema/HomeCinemaControlSwift/*.app/
+build/home-cinema/HomeCinemaControlSwift/.build/
 build/home-cinema/HomeCinemaControlSwift/.swift-module-cache/
+build/home-cinema/HomeCinemaControlSwift/.swiftpm/
+build/home-cinema/HomeCinemaControlSwift/.swiftpm-module-cache/
 build/home-cinema/HomeCinemaControlSwift/.clang-module-cache/
 build/home-cinema/HomeCinemaControlSwift/.tmp/
 build/home-cinema/HomeCinemaControlSwift/.go/
@@ -15,8 +19,12 @@ build/home-cinema/HomeCinemaControlSwift/HomeCinemaControl
 build/home-cinema/HomeCinemaControlSwift/*.zip
 .go/
 .go-build-cache/
+.gocache/
 .cache/
 server.log
 progress.json
 homecinema
+home-cinema
+home-cinema-dlna
+*.pid
 *.DS_Store

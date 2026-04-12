@@ -1,0 +1,4 @@
+057536d496e9e2a0087914123554101133434ea70c4248524495b2a4817814d0  releases/assets/v1.6/Home-Cinema-1.6-macOS-app.zip
+b33303332f884bc799c5d32df5c972fd117c92ab80b4ae5d52f4e514042c4ec6  releases/assets/v1.6/Home-Cinema-1.6-macOS-server.zip
+849c388e0c65128b9d66c9083d51f299ec8a83c8365c7b947dcd336255e75e78  releases/assets/v1.6/Home-Cinema-v1.6-release-notes.ru.md
+e6f858f135ed4db2ad2de0e416dea98c39ec073c66e77bd1b951bcae16035061  releases/assets/v1.6/Home-Cinema-v1.6-release-notes.en.md

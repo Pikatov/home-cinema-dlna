@@ -10,29 +10,26 @@ RES_DIR="$APP_DIR/Contents/Resources"
 SCRIPTS_DIR="$RES_DIR/scripts"
 PLIST_SRC="$SRC_DIR/Info.plist"
 SWIFT_FILES=(
-  "$SRC_DIR/AppTheme.swift"
-  "$SRC_DIR/ServerController.swift"
-  "$SRC_DIR/ContentView.swift"
-  "$SRC_DIR/HomeCinemaControlApp.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/AppTheme.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/ThemePreference.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/ServerController.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/ContentView.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/WindowChromeConfigurator.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/HomeCinemaControlApp.swift"
 )
 SDK=$(xcrun --show-sdk-path --sdk macosx)
-export SWIFT_MODULE_CACHE_PATH="$SRC_DIR/.swift-module-cache"
-mkdir -p "$SWIFT_MODULE_CACHE_PATH"
+export SWIFT_MODULE_CACHE_PATH=$(mktemp -d "${TMPDIR:-/tmp}/homecinema.swift-module-cache.XXXXXX")
 
 # Sandbox-friendly clang module cache (avoid ~/.cache/clang/ModuleCache)
-CLANG_MODULE_CACHE_PATH="$SRC_DIR/.clang-module-cache"
-mkdir -p "$CLANG_MODULE_CACHE_PATH"
+CLANG_MODULE_CACHE_PATH=$(mktemp -d "${TMPDIR:-/tmp}/homecinema.clang-module-cache.XXXXXX")
+trap 'rm -rf "$SWIFT_MODULE_CACHE_PATH" "$CLANG_MODULE_CACHE_PATH"' EXIT
 
 # Sandbox-friendly Go caches (avoid ~/Library/Caches and ~/go outside workspace)
 export GOCACHE="$SRC_DIR/.go-build-cache"
 mkdir -p "$GOCACHE"
-if [ -d "$HOME/go/pkg/mod" ]; then
-  export GOMODCACHE="$HOME/go/pkg/mod"
-else
-  export GOPATH="$SRC_DIR/.go"
-  export GOMODCACHE="$GOPATH/pkg/mod"
-  mkdir -p "$GOMODCACHE"
-fi
+export GOPATH="$SRC_DIR/.go"
+export GOMODCACHE="$GOPATH/pkg/mod"
+mkdir -p "$GOMODCACHE"
 
 # Targets
 SWIFT_TARGET_ARM64="arm64-apple-macos12"

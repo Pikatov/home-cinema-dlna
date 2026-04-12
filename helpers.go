@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -67,7 +69,7 @@ func setDataDir(dir string) {
 }
 
 func logOnce(format string, args ...interface{}) {
-	msg := sprintf(format, args...)
+	msg := fmt.Sprintf(format, args...)
 	lastLogMu.Lock()
 	defer lastLogMu.Unlock()
 	if msg == lastLogMsg && time.Since(lastLogAt) < 2*time.Second {
@@ -76,6 +78,55 @@ func logOnce(format string, args ...interface{}) {
 	lastLogMsg = msg
 	lastLogAt = time.Now()
 	log.Print(msg)
+}
+
+// generateUUIDv4 returns a random UUID v4 string.
+func generateUUIDv4() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t := uint64(time.Now().UnixNano())
+		for i := range b {
+			b[i] = byte(t >> ((i % 8) * 8))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// loadOrCreateUUID reads the persisted UUID from dir, or generates and saves a new one.
+func loadOrCreateUUID(dir string) string {
+	path := filepath.Join(dir, "server_uuid")
+	if data, err := os.ReadFile(path); err == nil {
+		if id := strings.TrimSpace(string(data)); isValidUUID(id) {
+			return id
+		}
+	}
+	id := generateUUIDv4()
+	_ = os.WriteFile(path, []byte(id+"\n"), 0600)
+	return id
+}
+
+func isValidUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	dashes := [4]int{8, 13, 18, 23}
+	di := 0
+	for i := 0; i < 36; i++ {
+		if di < 4 && i == dashes[di] {
+			if s[i] != '-' {
+				return false
+			}
+			di++
+			continue
+		}
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func getLocalIP() string {
