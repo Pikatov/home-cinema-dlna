@@ -1,0 +1,4 @@
+0706cd9b93e27dc03284df7deed1764dbbcd9ed6b0a8138d800ad0139a71f02d  releases/assets/v1.7/Home-Cinema-1.7-macOS-app.zip
+1c21ad73fb67a947db25b022f9cef0797dec216a4a3750884b4c658b09543435  releases/assets/v1.7/Home-Cinema-1.7-macOS-server.zip
+24cdf2221031b8c4bb9918e22f7630b60fa35782dbbba769ccf1f68acf0ebea6  releases/assets/v1.7/Home-Cinema-v1.7-release-notes.ru.md
+4494fabdd9f22e0e0b81ad6b7f1b4b57f9c47f0f06c6bdab207526b05560ce24  releases/assets/v1.7/Home-Cinema-v1.7-release-notes.en.md

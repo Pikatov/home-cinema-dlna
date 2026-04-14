@@ -576,7 +576,7 @@ loop:
 				break
 			}
 			if time.Since(lastSaved) >= progressUpdateEvery {
-				elapsed := time.Since(started).Seconds()
+				elapsed := seekSecs + time.Since(started).Seconds()
 				recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
 				lastSaved = time.Now()
 			}
@@ -591,7 +591,7 @@ loop:
 		}
 	}
 
-	elapsed := time.Since(started).Seconds()
+	elapsed := seekSecs + time.Since(started).Seconds()
 	recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
 	_ = cmd.Wait()
 }

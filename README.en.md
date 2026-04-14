@@ -4,7 +4,7 @@
 
 Home Cinema is a small Go-based DLNA/UPnP server with a companion macOS control app. If you just want to point your TV at a folder of movies without bringing in Plex, Jellyfin, a database, or a full media stack, this project is built for that workflow.
 
-The current release prepared in this repository is **1.6**.
+The current release prepared in this repository is **1.7**.
 
 MacOS App Screenshots:
 
@@ -65,7 +65,7 @@ The main files are:
 
 You can override the location with `HOMECINEMA_DATA_DIR` or `--data-dir`.
 
-Starting with `1.6`, the app also cleans up stale progress entries for files that no longer exist in the current media library, so deleted movies stop reappearing in the UI.
+Starting with `1.7`, the app also cleans up stale progress entries for files that no longer exist in the current media library, so deleted movies stop reappearing in the UI.
 
 When a movie already has saved progress, the server may prefer the resource that lets the TV start directly from that point. That makes "resume playback" much more reliable, but it comes with a clear limitation: after such a start, many DLNA clients can no longer seek properly and may stop showing the remaining playback time. At the moment this is an intentional tradeoff in favor of dependable resume behavior on TVs.
 
@@ -105,7 +105,7 @@ Launch it:
 ./build/home-cinema/run_control_app.sh
 ```
 
-The build script creates a universal `Home Cinema.app`, bundles a fresh server binary, and wires in the helper scripts used to start and stop the service. In `1.6`, the UI was simplified substantially: fewer repeated status labels, a clearer `Reset Progress` action, a compact saved-progress panel, and inline removal for individual items.
+The build script creates a universal `Home Cinema.app`, bundles a fresh server binary, and wires in the helper scripts used to start and stop the service. In `1.7`, the UI moves further toward a polished glass-style control deck with an `Auto/Light/Dark` theme switcher, softer background motion, more tactile action buttons, and a tighter saved-progress panel.
 
 ## Local pre-release check
 The repository includes a small pre-publish verification script:
@@ -144,7 +144,7 @@ go test ./...
 
 ## Docs
 - Change history — [CHANGELOG.md](CHANGELOG.md)
-- Release notes for `1.6` — [releases/v1.6.en.md](releases/v1.6.en.md)
-- Russian release notes for `1.6` — [releases/v1.6.md](releases/v1.6.md)
+- Release notes for `1.7` — [releases/v1.7.en.md](releases/v1.7.en.md)
+- Russian release notes for `1.7` — [releases/v1.7.md](releases/v1.7.md)
 - Security policy — [SECURITY.md](SECURITY.md)
 - License — [LICENSE](LICENSE)

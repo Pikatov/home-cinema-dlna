@@ -23,8 +23,8 @@ build/home-cinema/HomeCinemaControlSwift/*.zip
 .cache/
 server.log
 progress.json
-homecinema
-home-cinema
-home-cinema-dlna
+/homecinema
+/home-cinema
+/home-cinema-dlna
 *.pid
 *.DS_Store
