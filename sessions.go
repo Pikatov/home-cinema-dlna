@@ -13,12 +13,12 @@ import (
 // выходит, сессия закрывается.
 type activeSession struct {
 	ID              uint64    `json:"id"`
-	Kind            string    `json:"kind"`            // "direct" | "resume" | "tv"
-	Title           string    `json:"title"`           // отображаемое имя (basename без расширения)
-	RelPath         string    `json:"relPath"`         // путь в медиатеке
-	Client          string    `json:"client"`          // remote host без порта
-	UserAgent       string    `json:"userAgent"`       // сырой User-Agent клиента
-	Device          string    `json:"device"`          // friendly device name из UA
+	Kind            string    `json:"kind"`      // "direct" | "resume" | "tv"
+	Title           string    `json:"title"`     // отображаемое имя (basename без расширения)
+	RelPath         string    `json:"relPath"`   // путь в медиатеке
+	Client          string    `json:"client"`    // remote host без порта
+	UserAgent       string    `json:"userAgent"` // сырой User-Agent клиента
+	Device          string    `json:"device"`    // friendly device name из UA
 	StartedAt       time.Time `json:"startedAt"`
 	SeekSeconds     float64   `json:"seekSeconds"`     // позиция, с которой стартовали
 	DurationSeconds float64   `json:"durationSeconds"` // длительность файла (0 если неизвестна)

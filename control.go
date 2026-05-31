@@ -46,11 +46,11 @@ func statusHandler(w http.ResponseWriter, r *http.Request, ip string) {
 // statsPayload — лёгкий ответ для UI-poll'а. Без редактируемых полей и без
 // раскрытия абсолютных путей, чтобы безопасно отдавать без localhost-проверки.
 type statsPayload struct {
-	ActiveStreams int             `json:"activeStreams"`
-	ProgressCount int             `json:"progressCount"`
-	Version       string          `json:"version"`
-	StartedAt     string          `json:"startedAt"`
-	Sessions      []sessionDTO    `json:"sessions"`
+	ActiveStreams int          `json:"activeStreams"`
+	ProgressCount int          `json:"progressCount"`
+	Version       string       `json:"version"`
+	StartedAt     string       `json:"startedAt"`
+	Sessions      []sessionDTO `json:"sessions"`
 }
 
 // sessionDTO — публичная версия activeSession для /stats: ElapsedSeconds
