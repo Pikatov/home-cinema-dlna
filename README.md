@@ -8,8 +8,9 @@ Home Cinema — небольшой DLNA/UPnP-сервер на Go и аккур�
 
 macOS app screenshots:
 
-<img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/a4c35f90-6df3-4cd9-a1d8-ff930cf9da99" />
-<img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/4959e841-9816-411e-811e-27e18015e5cc" />
+<img width="408" height="276" alt="light" src="https://github.com/user-attachments/assets/485c6f9a-8360-438d-b077-8fd34a576a07" />
+<img width="408" height="276" alt="night" src="https://github.com/user-attachments/assets/600089e3-88f8-44aa-90e6-f0b72ccda2f0" />
+
 
 ## Что умеет проект
 - Поднимает DLNA/UPnP `MediaServer` и `ContentDirectory`.
