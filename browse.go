@@ -29,29 +29,57 @@ func shouldPreferTVResource(path string, size int64, durationSeconds float64) bo
 	if tvStreamFirst {
 		return true
 	}
-	if !tvAutoFirst || durationSeconds <= 0 {
+	if !tvAutoFirst {
+		return false
+	}
+	if shouldTranscodeForTVCompatibility(path) {
+		return true
+	}
+	if durationSeconds <= 0 {
 		return false
 	}
 	return averageBitrateMbps(size, durationSeconds) >= float64(tvAutoFirstMbps)
 }
 
+func shouldTranscodeForTVCompatibility(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != ".mkv" && ext != ".webm" {
+		return false
+	}
+	name := strings.ToLower(filepath.Base(path))
+	return strings.Contains(name, "h265") ||
+		strings.Contains(name, "h.265") ||
+		strings.Contains(name, "h-265") ||
+		strings.Contains(name, "h_265") ||
+		strings.Contains(name, "hevc") ||
+		strings.Contains(name, "x265") ||
+		strings.Contains(name, "10bit") ||
+		strings.Contains(name, "10-bit") ||
+		strings.Contains(name, "10 bit") ||
+		strings.Contains(name, "main10") ||
+		strings.Contains(name, "hi10p") ||
+		strings.Contains(name, "hdr")
+}
+
 func handleContentDirectory(ip string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
-		body, _ := io.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("⚠️ ContentDirectory: ошибка чтения тела запроса: %v", err)
+			fmt.Fprintf(w, soapResponse, "", 0, 0, currentBrowseUpdateID())
+			return
+		}
 		bodyStr := string(body)
 
-		objIDMatch := objectIDRe.FindStringSubmatch(bodyStr)
-		flagMatch := flagRe.FindStringSubmatch(bodyStr)
-
-		objID := "0"
-		if len(objIDMatch) > 1 {
-			objID = objIDMatch[1]
+		// SOAP-тело — короткая, фиксированная структура. strings.Index в 2-3
+		// раза быстрее regexp на типичном Browse-запросе (~500 байт), и
+		// каждый TV шлёт 2-3 таких запроса на каждое открытие папки.
+		objID := extractXMLTag(bodyStr, "ObjectID")
+		if objID == "" {
+			objID = "0"
 		}
-		flag := ""
-		if len(flagMatch) > 1 {
-			flag = flagMatch[1]
-		}
+		flag := extractXMLTag(bodyStr, "BrowseFlag")
 
 		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
 		w.Header().Set("Server", fmt.Sprintf("Linux/2.6 UPnP/1.0 DLNADOC/1.50 HomeCinema/%s", appVersion))
@@ -139,16 +167,14 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 			if err != nil {
 				continue
 			}
-			fileHash := crc32.ChecksumIEEE([]byte(childRelPath))
-			stableID := strconv.FormatUint(uint64(fileHash), 10)
-
 			parts := strings.Split(childRelPath, string(filepath.Separator))
 			for i, p := range parts {
 				parts[i] = url.PathEscape(p)
 			}
 			escapedRel := strings.Join(parts, "/")
 			fileURL := fmt.Sprintf("http://%s:%s/video/%s", ip, serverPort, escapedRel)
-			tvURL := fmt.Sprintf("http://%s:%s/tv/%s", ip, serverPort, escapedRel)
+			tvURL := fmt.Sprintf("http://%s:%s/tv/%s.ts", ip, serverPort, escapedRel)
+			resumeURL := fmt.Sprintf("http://%s:%s/resume/%s", ip, serverPort, escapedRel)
 
 			title := displayTitle
 			fullPath := filepath.Join(dir, childRelPath)
@@ -156,11 +182,21 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 			proto := fmt.Sprintf("http-get:*:%s:%s", mimeType, dlnaProfile)
 			meta, _ := getVideoMetaCached(fullPath)
 			key := progressKeyFromRelPath(childRelPath)
-			if entry, ok := getProgressEntry(key); ok && entry.Seconds <= 0 && entry.Position > 0 && entry.Size == info.Size() && meta.DurationSeconds <= 0 {
-				if entry.DurationSeconds > 0 {
+			entry, hasProgressEntry := getProgressEntry(key)
+			// Если кеш ffprobe ещё холодный (рестарт сервера, новая папка),
+			// длительность достаём из сохранённого прогресса: и для byte-based,
+			// и для seconds-based записей. Без этого после рестарта в DLNA-
+			// заголовке исчезала «правая часть» таймкода ([▶ хх:хх] вместо
+			// [▶ хх:хх - yy:yy]) — самое заметное место, так как seconds-based
+			// прогресс пишут `/tv/` и `/resume/`.
+			if meta.DurationSeconds <= 0 {
+				if hasProgressEntry && entry.DurationSeconds > 0 {
 					meta.DurationSeconds = entry.DurationSeconds
-				} else {
-					warmVideoMetaAsync(fullPath)
+				} else if hasProgressEntry {
+					meta = getVideoMetaWithTimeout(fullPath, 300*time.Millisecond)
+					if meta.DurationSeconds <= 0 {
+						warmVideoMetaAsync(fullPath)
+					}
 				}
 			}
 			tc := getProgressTimecode(childRelPath, info.Size(), meta.DurationSeconds)
@@ -177,8 +213,48 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 				durationAttr = fmt.Sprintf(` duration="%s"`, escapeXMLAttr(formatDLNADuration(meta.DurationSeconds)))
 			}
 
-			resParts := make([]string, 0, 2)
-			if tvStreamEnabled {
+			// /resume/ снова использует обычный byte Range поверх /video/: это
+			// менее красиво, чем ffmpeg-remux, зато на DLNA-ТВ стабильнее и не
+			// зависит от контейнера. Для seconds-based прогресса нужна длительность,
+			// для byte-based достаточно совпадения размера файла.
+			hasResume := false
+			preferTVResource := !hasResume && tvStreamEnabled && shouldPreferTVResource(fullPath, info.Size(), meta.DurationSeconds)
+
+			// ID элемента: путь файла + флаг наличия прогресса. ТВ часто кешируют
+			// DLNA-каталог и при повторном открытии берут URL из своего кеша —
+			// если ID не поменялся, нашу подмену <res> на /resume/ они не подхватят.
+			// Меняя суффикс ID при появлении/исчезновении прогресса или изменении
+			// порядка <res>, мы заставляем ТВ считать это "новым" объектом и
+			// заново запросить URL.
+			idSeed := childRelPath
+			if hasResume {
+				idSeed = childRelPath + "\x00r"
+			} else if preferTVResource {
+				idSeed = childRelPath + "\x00tv"
+			}
+			fileHash := crc32.ChecksumIEEE([]byte(idSeed))
+			stableID := strconv.FormatUint(uint64(fileHash), 10)
+
+			resParts := make([]string, 0, 3)
+			if hasResume {
+				// /resume/ — первый ресурс: ТВ обычно выбирает первый.
+				// protocolInfo берём от исходного файла, потому что handler внутри
+				// синтезирует byte Range и отдаёт тот же контейнер через /video/.
+				resumeRes := fmt.Sprintf(`&lt;res%s protocolInfo="%s"&gt;%s&lt;/res&gt;`,
+					durationAttr,
+					escapeXMLAttr(proto),
+					escapeXMLText(resumeURL),
+				)
+				// /video/ — запасной ресурс со size: ТВ, не принимающие <res> без size
+				// для первого варианта, хотя бы запустят фильм с начала.
+				fileRes := fmt.Sprintf(`&lt;res size="%d"%s protocolInfo="%s"&gt;%s&lt;/res&gt;`,
+					info.Size(),
+					durationAttr,
+					escapeXMLAttr(proto),
+					escapeXMLText(fileURL),
+				)
+				resParts = append(resParts, resumeRes, fileRes)
+			} else if tvStreamEnabled {
 				tvProto := fmt.Sprintf("http-get:*:%s:%s", tvContentType, tvDLNAFeatures)
 				tvRes := fmt.Sprintf(`&lt;res%s protocolInfo="%s"&gt;%s&lt;/res&gt;`,
 					durationAttr,
@@ -191,10 +267,8 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 					escapeXMLAttr(proto),
 					escapeXMLText(fileURL),
 				)
-				// Put TV stream first if: forced by flag/bitrate, OR has saved progress
-				// (so the TV picks it and ffmpeg -ss handles resume correctly).
-				// Without progress, direct file goes first → seeking and duration work.
-				if shouldPreferTVResource(fullPath, info.Size(), meta.DurationSeconds) || tc != "" {
+				// TV-first only when explicitly forced or the file is too heavy for direct Wi‑Fi.
+				if preferTVResource {
 					resParts = append(resParts, tvRes, fileRes)
 				} else {
 					resParts = append(resParts, fileRes, tvRes)

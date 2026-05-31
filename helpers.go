@@ -189,10 +189,20 @@ func setMediaDir(path string) {
 }
 
 func invalidateBrowseCache() {
+	invalidateBrowseCacheWithNotify(true)
+}
+
+func invalidateBrowseCacheQuiet() {
+	invalidateBrowseCacheWithNotify(false)
+}
+
+func invalidateBrowseCacheWithNotify(notify bool) {
 	browseCacheMu.Lock()
 	browseCache = make(map[string]browseCacheEntry)
 	browseCacheMu.Unlock()
-	scheduleBrowseNotification()
+	if notify {
+		scheduleBrowseNotification()
+	}
 }
 
 func scheduleBrowseNotification() {
@@ -300,15 +310,31 @@ func safeJoinUnderBase(baseDir, rel string) (string, bool) {
 
 func isVideoExt(ext string) bool {
 	switch strings.ToLower(ext) {
-	case ".mp4", ".mkv", ".avi", ".m4v":
+	case ".mp4", ".mkv", ".avi", ".m4v", ".mov":
 		return true
 	default:
 		return false
 	}
 }
 
-func stringsTrimPrefix(s, prefix string) string {
-	return strings.TrimPrefix(s, prefix)
+// extractXMLTag находит первое значение в простом теге <name>value</name>
+// внутри XML-строки. Поддерживает только плоский text content без вложенных
+// тегов и не разбирает атрибуты — этого достаточно для SOAP-запросов
+// ContentDirectory.Browse, где ObjectID/BrowseFlag всегда плоские.
+// Возвращает "" если тег не найден.
+func extractXMLTag(s, name string) string {
+	open := "<" + name + ">"
+	close := "</" + name + ">"
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	i += len(open)
+	j := strings.Index(s[i:], close)
+	if j < 0 {
+		return ""
+	}
+	return s[i : i+j]
 }
 
 func stringsTrimDefault(s, fallback string) string {

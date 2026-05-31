@@ -1,0 +1,4 @@
+612a678298d64f23677620a37bcfe941b6dae418dd5b2d4a84527ce38a062353  Home-Cinema-1.8-macOS-app.zip
+ecc2e7aee0ec44530c125add6ea59153dcb9bdc130c8b0dc1395f1db6764cc9e  Home-Cinema-1.8-macOS-server.zip
+19273b1e90e82a5ed858b6274dadc07d94720722f17f7a75430675900c677701  Home-Cinema-v1.8-release-notes.en.md
+960d87b73ca2961165c6efc8c3d24a56d50f9ead6b7115ba2b625cce64cd78b9  Home-Cinema-v1.8-release-notes.ru.md

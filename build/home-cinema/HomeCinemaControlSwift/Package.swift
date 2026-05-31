@@ -4,7 +4,10 @@ import PackageDescription
 let package = Package(
     name: "HomeCinemaControlSwift",
     platforms: [
-        .macOS(.v12)
+        // macOS 14 нужен для Observation framework (@Observable) и scenePhase
+        // на macOS. Поддержка более ранних версий потребовала бы ObservableObject
+        // и потеряла бы pause-animation-in-background.
+        .macOS(.v14)
     ],
     products: [
         .executable(

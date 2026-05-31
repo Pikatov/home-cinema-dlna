@@ -34,7 +34,7 @@ type progressSummary struct {
 	LastUpdated time.Time
 }
 
-var progressStoreRef = newProgressStore(progressFile)
+var progressStoreRef *progressStore
 
 func newProgressStore(path string) *progressStore {
 	return &progressStore{
@@ -237,6 +237,12 @@ func (ps *progressStore) RecordBytes(key string, position, size int64, durationS
 		durationSeconds = existing.DurationSeconds
 	}
 
+	// shouldPersistByteProgress сам фильтрует probe-запросы (минимум 1 MB
+	// и 10 секунд по времени), поэтому отдельной P-8 защиты от перезаписи
+	// Seconds-записи здесь не нужно — пробинг не пройдёт через persist-проверку.
+	// Если же byte-progress всё-таки доходит сюда из реального /video/ -
+	// пользователь играет файл «как есть», и новые байты должны выигрывать.
+
 	if shouldClearProgressByBytes(position, size, durationSeconds) {
 		if _, ok := ps.data[key]; ok {
 			delete(ps.data, key)
@@ -252,14 +258,18 @@ func (ps *progressStore) RecordBytes(key string, position, size int64, durationS
 		return
 	}
 
-	ps.data[key] = progressEntry{
+	newEntry := progressEntry{
 		Position:        position,
 		Size:            size,
 		DurationSeconds: durationSeconds,
 		Updated:         time.Now(),
 	}
+	if durationSeconds <= 0 && existing.Seconds > 0 {
+		newEntry.Seconds = existing.Seconds
+	}
+	ps.data[key] = newEntry
 	ps.RequestSave()
-	invalidateBrowseCache()
+	maybeInvalidateBrowseCache(existing, newEntry, durationSeconds)
 }
 
 func (ps *progressStore) RecordSeconds(key string, seconds float64, durationSeconds float64) {
@@ -290,13 +300,18 @@ func (ps *progressStore) RecordSeconds(key string, seconds float64, durationSeco
 		return
 	}
 
-	ps.data[key] = progressEntry{
+	newEntry := progressEntry{
 		Seconds:         seconds,
 		DurationSeconds: durationSeconds,
 		Updated:         time.Now(),
 	}
+	if existing.Position > 0 && existing.Size > 0 {
+		newEntry.Position = existing.Position
+		newEntry.Size = existing.Size
+	}
+	ps.data[key] = newEntry
 	ps.RequestSave()
-	invalidateBrowseCache()
+	maybeInvalidateBrowseCache(existing, newEntry, durationSeconds)
 }
 
 func (ps *progressStore) GetEntry(key string) (progressEntry, bool) {
@@ -326,6 +341,55 @@ func (ps *progressStore) ClearAll() int {
 	removed := len(ps.data)
 	if removed > 0 {
 		ps.data = make(map[string]progressEntry)
+	}
+	ps.mu.Unlock()
+
+	if removed > 0 {
+		ps.RequestSave()
+		invalidateBrowseCache()
+	}
+	return removed
+}
+
+// PruneMissingFiles удаляет записи прогресса для файлов, которых нет под
+// текущим mediaDir. Вызывается при смене папки и периодически — иначе
+// устаревшие записи живут до Load()-cutoff (7 дней) и засоряют DLNA-каталог
+// «фантомными» таймкодами.
+func (ps *progressStore) PruneMissingFiles(mediaDir string) int {
+	if mediaDir == "" {
+		return 0
+	}
+	ps.mu.Lock()
+	candidates := make([]string, 0, len(ps.data))
+	for k := range ps.data {
+		candidates = append(candidates, k)
+	}
+	ps.mu.Unlock()
+
+	// Stat без mu, чтобы не блокировать стримы во время дискового I/O.
+	missing := make([]string, 0)
+	for _, k := range candidates {
+		fullPath, ok := safeJoinUnderBase(mediaDir, k)
+		if !ok {
+			missing = append(missing, k)
+			continue
+		}
+		if _, err := os.Stat(fullPath); err != nil {
+			missing = append(missing, k)
+		}
+	}
+
+	if len(missing) == 0 {
+		return 0
+	}
+
+	ps.mu.Lock()
+	removed := 0
+	for _, k := range missing {
+		if _, ok := ps.data[k]; ok {
+			delete(ps.data, k)
+			removed++
+		}
 	}
 	ps.mu.Unlock()
 
@@ -491,6 +555,13 @@ func deleteProgress(key string) bool {
 	return progressStoreRef.Delete(key)
 }
 
+func pruneMissingProgress(mediaDir string) int {
+	if progressStoreRef == nil {
+		return 0
+	}
+	return progressStoreRef.PruneMissingFiles(mediaDir)
+}
+
 func formatTimecode(pos, size int64, durationSecs float64) string {
 	if durationSecs <= 0 || size <= 0 {
 		return ""
@@ -517,6 +588,36 @@ func formatSecondsTimecode(seconds float64) string {
 		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 	}
 	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+// maybeInvalidateBrowseCache инвалидирует browse-cache только если у элемента
+// поменялся ОТОБРАЖАЕМЫЙ таймкод (формат `h:mm:ss`, разрешение 1 с). Это
+// устраняет тысячи лишних cache-bust'ов во время стрима: прогресс пишется
+// раз в 250 мс – 3 с, но человек видит ту же строку «1:23:45», пока
+// фактическая секунда не сменилась.
+//
+// При смене displayed-timecode перерендерить каталог нужно при следующем Browse,
+// но нельзя слать ContentDirectory NOTIFY на каждый такой тик: часть ТВ на любое
+// событие каталога заново опрашивает папку прямо во время playback, что выглядит
+// как регулярный фриз примерно раз в 5 секунд.
+func maybeInvalidateBrowseCache(old, new progressEntry, durationSecs float64) {
+	if displayedTimecodeSeconds(old, durationSecs) == displayedTimecodeSeconds(new, durationSecs) {
+		return
+	}
+	invalidateBrowseCacheQuiet()
+}
+
+// displayedTimecodeSeconds возвращает целочисленную секунду, в которую
+// округляется отображаемый в DLNA-каталоге таймкод. Используется только для
+// сравнения «нужно ли инвалидировать кеш каталога».
+func displayedTimecodeSeconds(e progressEntry, durationSecs float64) int64 {
+	if e.Seconds > 0 {
+		return int64(e.Seconds)
+	}
+	if e.Position > 0 && e.Size > 0 && durationSecs > 0 {
+		return int64(durationSecs * float64(e.Position) / float64(e.Size))
+	}
+	return 0
 }
 
 func progressKeyFromRelPath(rel string) string {

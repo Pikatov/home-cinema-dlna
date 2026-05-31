@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,19 +64,53 @@ func resolveExec(bin string) (string, bool) {
 	if bin == "" {
 		return "", false
 	}
+	candidate := bin
 	if strings.ContainsRune(bin, filepath.Separator) {
-		return bin, isExecutable(bin)
+		if !isExecutable(bin) {
+			return "", false
+		}
+	} else {
+		p, err := exec.LookPath(bin)
+		if err != nil {
+			return "", false
+		}
+		candidate = p
 	}
-	p, err := exec.LookPath(bin)
-	if err != nil {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, candidate, "-version").Run(); err != nil {
+		log.Printf("⚠️ %s найден, но не запускается: %v", filepath.Base(candidate), err)
 		return "", false
 	}
-	return p, true
+	return candidate, true
+}
+
+func probeErrorString(err error, out []byte) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(string(out))
+	if msg == "" {
+		msg = err.Error()
+	} else {
+		msg = fmt.Sprintf("%v: %s", err, msg)
+	}
+	return msg
 }
 
 type videoMeta struct {
 	DurationSeconds float64
+	// LastProbedAt — момент последнего ffprobe для файла. Используется чтобы
+	// не перепрашивать битые файлы (DurationSeconds==0) на каждом запросе —
+	// см. metaNegativeTTL и warmVideoMetaAsync.
+	LastProbedAt time.Time
 }
+
+// metaNegativeTTL — как долго не дёргать ffprobe повторно для файлов,
+// у которых длительность не определилась (битый контейнер, отсутствие
+// видеопотока). Положительные результаты живут «вечно» (до clearMetaCache).
+const metaNegativeTTL = 5 * time.Minute
 
 var (
 	metaCacheMu sync.RWMutex
@@ -110,8 +148,16 @@ func warmVideoMetaAsync(filePath string) {
 	if filePath == "" {
 		return
 	}
-	if _, ok := getVideoMetaCached(filePath); ok {
-		return
+	if m, ok := getVideoMetaCached(filePath); ok {
+		// Положительный кеш — выходим, ffprobe не нужен.
+		if m.DurationSeconds > 0 {
+			return
+		}
+		// Отрицательный кеш в пределах TTL — тоже выходим, чтобы битый файл
+		// не дёргал ffprobe на каждом запросе.
+		if !m.LastProbedAt.IsZero() && time.Since(m.LastProbedAt) < metaNegativeTTL {
+			return
+		}
 	}
 	metaWarmMu.Lock()
 	if metaWarm[filePath] {
@@ -137,10 +183,25 @@ func getVideoMeta(filePath string) videoMeta {
 func getVideoMetaWithTimeout(filePath string, timeout time.Duration) videoMeta {
 	metaCacheMu.RLock()
 	if m, ok := metaCache[filePath]; ok {
-		metaCacheMu.RUnlock()
-		return m
+		// Положительный кеш — отдаём. Отрицательный — отдаём в пределах TTL,
+		// чтобы битые файлы не запускали новый ffprobe на каждом запросе.
+		if m.DurationSeconds > 0 || (!m.LastProbedAt.IsZero() && time.Since(m.LastProbedAt) < metaNegativeTTL) {
+			metaCacheMu.RUnlock()
+			return m
+		}
 	}
 	metaCacheMu.RUnlock()
+
+	if m, ok := getContainerDuration(filePath); ok {
+		metaCacheMu.Lock()
+		metaCache[filePath] = m
+		metaCacheMu.Unlock()
+		return m
+	}
+
+	if ffprobeExe == "" {
+		return videoMeta{LastProbedAt: time.Now()}
+	}
 
 	var (
 		ctx    context.Context
@@ -153,23 +214,116 @@ func getVideoMetaWithTimeout(filePath string, timeout time.Duration) videoMeta {
 		ctx = context.Background()
 	}
 
-	var m videoMeta
+	m := videoMeta{LastProbedAt: time.Now()}
 	out, err := exec.CommandContext(ctx, ffprobeExe,
 		"-v", "error",
 		"-show_entries", "format=duration",
 		"-of", "default=noprint_wrappers=1:nokey=1",
 		filePath,
-	).Output()
+	).CombinedOutput()
 	if err == nil {
 		if secs, err2 := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); err2 == nil && secs > 0 {
 			m.DurationSeconds = secs
 		}
+	} else if streamDebugEnabled {
+		log.Printf("DBG ffprobe failed file=%q err=%s", filePath, probeErrorString(err, out))
 	}
 
 	metaCacheMu.Lock()
 	metaCache[filePath] = m
 	metaCacheMu.Unlock()
 	return m
+}
+
+func getContainerDuration(filePath string) (videoMeta, bool) {
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".mkv", ".webm":
+		return getMatroskaDuration(filePath)
+	default:
+		return videoMeta{}, false
+	}
+}
+
+func getMatroskaDuration(filePath string) (videoMeta, bool) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return videoMeta{}, false
+	}
+	defer f.Close()
+
+	const maxHeader = 32 << 20
+	buf := make([]byte, maxHeader)
+	n, _ := f.Read(buf)
+	buf = buf[:n]
+	if len(buf) == 0 {
+		return videoMeta{}, false
+	}
+
+	scale := float64(1000000) // Matroska default TimecodeScale, nanoseconds.
+	if i := bytes.Index(buf, []byte{0x2A, 0xD7, 0xB1}); i >= 0 {
+		if value, ok := readEBMLUnsigned(buf[i+3:]); ok && value > 0 {
+			scale = float64(value)
+		}
+	}
+
+	if i := bytes.Index(buf, []byte{0x44, 0x89}); i >= 0 {
+		if value, ok := readEBMLFloat(buf[i+2:]); ok && value > 0 {
+			return videoMeta{
+				DurationSeconds: value * scale / 1e9,
+				LastProbedAt:    time.Now(),
+			}, true
+		}
+	}
+	return videoMeta{}, false
+}
+
+func readEBMLUnsigned(data []byte) (uint64, bool) {
+	size, sizeLen, ok := readEBMLSize(data)
+	if !ok || size == 0 || size > 8 || len(data) < sizeLen+int(size) {
+		return 0, false
+	}
+	var value uint64
+	for _, b := range data[sizeLen : sizeLen+int(size)] {
+		value = (value << 8) | uint64(b)
+	}
+	return value, true
+}
+
+func readEBMLFloat(data []byte) (float64, bool) {
+	size, sizeLen, ok := readEBMLSize(data)
+	if !ok || len(data) < sizeLen+int(size) {
+		return 0, false
+	}
+	value := data[sizeLen : sizeLen+int(size)]
+	switch size {
+	case 4:
+		return float64(math.Float32frombits(binary.BigEndian.Uint32(value))), true
+	case 8:
+		return math.Float64frombits(binary.BigEndian.Uint64(value)), true
+	default:
+		return 0, false
+	}
+}
+
+func readEBMLSize(data []byte) (uint64, int, bool) {
+	if len(data) == 0 {
+		return 0, 0, false
+	}
+	first := data[0]
+	mask := byte(0x80)
+	length := 1
+	for length <= 8 && first&mask == 0 {
+		mask >>= 1
+		length++
+	}
+	if length > 8 || len(data) < length {
+		return 0, 0, false
+	}
+	value := uint64(first &^ mask)
+	for i := 1; i < length; i++ {
+		value = (value << 8) | uint64(data[i])
+	}
+	return value, length, true
 }
 
 func stopWarmupMeta() {
@@ -184,6 +338,9 @@ func stopWarmupMeta() {
 
 func warmupMetaCache(dir string) {
 	if !warmupMetaEnabled {
+		return
+	}
+	if ffprobeExe == "" {
 		return
 	}
 

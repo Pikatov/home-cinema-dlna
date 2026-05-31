@@ -100,3 +100,42 @@ func TestProgressStoreSummaryAndClearAll(t *testing.T) {
 		t.Fatalf("summary.Count after clear = %d, want 0", summary.Count)
 	}
 }
+
+func TestProgressTimecodeInvalidationDoesNotNotify(t *testing.T) {
+	prevCache := browseCache
+	prevUpdateID := browseUpdateID
+	prevTimer := browseNotifyTimer
+	prevNotifyAt := browseNotifyAt
+	defer func() {
+		browseCacheMu.Lock()
+		browseCache = prevCache
+		browseCacheMu.Unlock()
+		browseNotifyMu.Lock()
+		if browseNotifyTimer != nil {
+			browseNotifyTimer.Stop()
+		}
+		browseNotifyTimer = prevTimer
+		browseNotifyAt = prevNotifyAt
+		browseNotifyMu.Unlock()
+		browseUpdateID = prevUpdateID
+	}()
+
+	browseCacheMu.Lock()
+	browseCache = map[string]browseCacheEntry{
+		"": {payload: "cached", count: 1, expires: time.Now().Add(time.Hour)},
+	}
+	browseCacheMu.Unlock()
+
+	maybeInvalidateBrowseCache(
+		progressEntry{Seconds: 10},
+		progressEntry{Seconds: 11},
+		3600,
+	)
+
+	if _, _, ok := getBrowseCache(""); ok {
+		t.Fatal("expected browse cache to be invalidated")
+	}
+	if got := currentBrowseUpdateID(); got != prevUpdateID {
+		t.Fatalf("browse update ID = %d, want %d", got, prevUpdateID)
+	}
+}

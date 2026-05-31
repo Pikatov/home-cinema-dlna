@@ -12,6 +12,7 @@ PLIST_SRC="$SRC_DIR/Info.plist"
 SWIFT_FILES=(
   "$SRC_DIR/Sources/HomeCinemaControlSwift/AppTheme.swift"
   "$SRC_DIR/Sources/HomeCinemaControlSwift/ThemePreference.swift"
+  "$SRC_DIR/Sources/HomeCinemaControlSwift/GlassPanel.swift"
   "$SRC_DIR/Sources/HomeCinemaControlSwift/ServerController.swift"
   "$SRC_DIR/Sources/HomeCinemaControlSwift/ContentView.swift"
   "$SRC_DIR/Sources/HomeCinemaControlSwift/WindowChromeConfigurator.swift"
@@ -31,9 +32,10 @@ export GOPATH="$SRC_DIR/.go"
 export GOMODCACHE="$GOPATH/pkg/mod"
 mkdir -p "$GOMODCACHE"
 
-# Targets
-SWIFT_TARGET_ARM64="arm64-apple-macos12"
-SWIFT_TARGET_X86="x86_64-apple-macos12"
+# Targets — min macOS 14 (Sonoma) для Observation framework (@Observable) и
+# scenePhase-aware UI. См. Package.swift / Info.plist.
+SWIFT_TARGET_ARM64="arm64-apple-macos14"
+SWIFT_TARGET_X86="x86_64-apple-macos14"
 
 # Icon setup
 ICON_SRC="$SRC_DIR/icon.png"

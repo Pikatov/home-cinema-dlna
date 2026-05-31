@@ -1,16 +1,76 @@
 import AppKit
 import Foundation
+import Observation
 
+/// `ServerController` — единственная state-машина приложения.
+/// Использует `@Observable` (macOS 14+): SwiftUI re-renders точечно по
+/// прочитанным свойствам, без `@Published`-инвалидации всего ViewModel.
+@Observable
 @MainActor
-final class ServerController: ObservableObject {
-    struct ProgressItem: Identifiable {
+final class ServerController {
+    /// LiveSession — UI-сторонняя модель сессии «сейчас играет», парсит
+    /// elapsedSeconds в готовый формат.
+    struct LiveSession: Identifiable, Hashable {
+        let id: UInt64
+        let kind: String     // "direct" | "resume" | "tv"
+        let title: String
+        let client: String
+        let device: String   // friendly name из User-Agent ("Samsung TV", "VLC", ...)
+        let elapsedSeconds: Double
+        let durationSeconds: Double
+
+        var progressFraction: Double? {
+            guard durationSeconds > 0, elapsedSeconds > 0 else { return nil }
+            return min(1.0, max(0.0, elapsedSeconds / durationSeconds))
+        }
+
+        var timecode: String {
+            Self.formatPlayback(seconds: elapsedSeconds)
+        }
+
+        var totalTimecode: String {
+            guard durationSeconds > 0 else { return "" }
+            return Self.formatPlayback(seconds: durationSeconds)
+        }
+
+        var kindLabel: String {
+            switch kind {
+            case "direct": return "DIRECT"
+            case "resume": return "RESUME"
+            case "tv":     return "TRANSCODE"
+            default:       return kind.uppercased()
+            }
+        }
+
+        static func formatPlayback(seconds: Double) -> String {
+            guard seconds > 0 else { return "0:00" }
+            let total = Int(seconds.rounded())
+            let h = total / 3600
+            let m = (total % 3600) / 60
+            let s = total % 60
+            if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+            return String(format: "%d:%02d", m, s)
+        }
+    }
+
+    struct ProgressItem: Identifiable, Hashable {
         let id: String
         let fileName: String
         let folderName: String
-        let timecode: String
+        let timecode: String       // «watched» — текущая позиция (h:mm:ss)
+        let totalTimecode: String  // длительность фильма (h:mm:ss), пусто если неизвестна
         let updatedText: String
         let updatedAt: Date?
         let progressFraction: Double?
+    }
+
+    /// Snapshot стёртого прогресса для undo. Хранит сериализованный JSON,
+    /// который запишется обратно в `progress.json` если пользователь нажмёт
+    /// «отменить» в течение `undoWindow`.
+    struct UndoSnapshot {
+        let payload: Data
+        let cleared: Int
+        let expiresAt: Date
     }
 
     private struct StoredProgressEntry: Codable {
@@ -21,49 +81,55 @@ final class ServerController: ObservableObject {
         let updated: String?
     }
 
-    @Published var mediaDir: String
-    @Published var isRunning: Bool = false
-    @Published var isBusy: Bool = false
-    @Published var statusMessage: String = "Choose a folder."
-    @Published var endpoint: String = "http://127.0.0.1:8080"
-    @Published var startedAtText: String = "—"
-    @Published var mediaFolderName: String = "Not selected"
-    @Published var logPath: String = ""
-    @Published var progressCount: Int = 0
-    @Published var progressUpdatedText: String = "No saved progress"
-    @Published var progressItems: [ProgressItem] = []
+    // MARK: – Observable state
+
+    var mediaDir: String
+    var isRunning: Bool = false
+    var isBusy: Bool = false
+    var statusMessage: String = "Choose a folder."
+    var endpoint: String = "http://127.0.0.1:8080"
+    var startedAtText: String = "—"
+    var mediaFolderName: String = "Not selected"
+    var logPath: String = ""
+    var progressCount: Int = 0
+    var progressUpdatedText: String = "No saved progress"
+    var progressItems: [ProgressItem] = []
+    /// Сколько /video/ стримов сейчас активны. Подсвечивает «On Air»-индикатор
+    /// в hero-блоке. Обновляется через /stats каждые 2 с.
+    var activeStreams: Int = 0
+    /// Список «сейчас играет» из /stats — каждая запись = открытый стрим.
+    /// Используется для Now Playing-карточек в Liquid Glass UI.
+    var liveSessions: [LiveSession] = []
+    /// Snapshot для undo. Истечение — `expiresAt`; через `undoWindow` после
+    /// сброса прогресса snapshot молча сбрасывается.
+    var undoSnapshot: UndoSnapshot?
 
     let serverPort: String = "8080"
+    let undoWindow: TimeInterval = 5
+
     private let mediaDirDefaultsKey = "mediaDir"
+    private var undoExpiryTask: Task<Void, Never>?
 
     init() {
         let stored = UserDefaults.standard.string(forKey: mediaDirDefaultsKey) ?? ""
-        let fallback = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies", isDirectory: true).path
+        let fallback = FileManager.default
+            .homeDirectoryForCurrentUser
+            .appendingPathComponent("Movies", isDirectory: true).path
         self.mediaDir = stored.isEmpty ? fallback : stored
         self.mediaFolderName = URL(fileURLWithPath: mediaDir).lastPathComponent
         self.logPath = stateDirectoryURL.appendingPathComponent("server.log").path
         ensureStateDirectory()
     }
 
+    // MARK: – Paths
+
     var serverBinaryURL: URL {
         bundleMacOSDirectoryURL.appendingPathComponent("HomeCinemaServer", isDirectory: false)
     }
-
-    var startScriptURL: URL {
-        scriptsDirectoryURL.appendingPathComponent("start_server.sh", isDirectory: false)
-    }
-
-    var stopScriptURL: URL {
-        scriptsDirectoryURL.appendingPathComponent("stop_server.sh", isDirectory: false)
-    }
-
-    var statusScriptURL: URL {
-        scriptsDirectoryURL.appendingPathComponent("status_server.sh", isDirectory: false)
-    }
-
-    var progressFileURL: URL {
-        stateDirectoryURL.appendingPathComponent("progress.json", isDirectory: false)
-    }
+    var startScriptURL: URL { scriptsDirectoryURL.appendingPathComponent("start_server.sh") }
+    var stopScriptURL: URL { scriptsDirectoryURL.appendingPathComponent("stop_server.sh") }
+    var statusScriptURL: URL { scriptsDirectoryURL.appendingPathComponent("status_server.sh") }
+    var progressFileURL: URL { stateDirectoryURL.appendingPathComponent("progress.json") }
 
     private var scriptsDirectoryURL: URL {
         Bundle.main.resourceURL!.appendingPathComponent("scripts", isDirectory: true)
@@ -78,6 +144,8 @@ final class ServerController: ObservableObject {
         return base.appendingPathComponent("HomeCinema", isDirectory: true)
     }
 
+    // MARK: – Public API
+
     func setMediaDir(_ newValue: String) {
         mediaDir = newValue
         mediaFolderName = URL(fileURLWithPath: newValue).lastPathComponent
@@ -85,9 +153,7 @@ final class ServerController: ObservableObject {
     }
 
     func refreshStatus() {
-        Task {
-            await refreshStatusNow()
-        }
+        Task { await refreshStatusNow() }
     }
 
     func startServer() {
@@ -145,7 +211,6 @@ final class ServerController: ObservableObject {
             statusMessage = "Library selected."
             return
         }
-
         Task {
             let ok = await updateRunningMediaDir()
             statusMessage = ok ? "Library updated." : "Could not update the running server."
@@ -162,12 +227,20 @@ final class ServerController: ObservableObject {
         NSWorkspace.shared.open(target)
     }
 
+    /// Сбрасывает весь прогресс, но сохраняет snapshot — `undoLastReset()` в
+    /// течение `undoWindow` секунд восстанавливает. Если сервер запущен, по
+    /// сети идёт POST /reset-progress; в обоих режимах snapshot читается
+    /// до сброса (из локального файла), чтобы undo был гарантирован.
     func resetProgress() {
         isBusy = true
         statusMessage = "Clearing progress..."
 
         Task {
             defer { isBusy = false }
+
+            // Снимок ДО сброса — даже если сервер запущен, JSON-файл доступен.
+            let snapshotData = (try? Data(contentsOf: progressFileURL)) ?? Data("{}".utf8)
+            let priorEntries = loadStoredProgressEntries()
 
             do {
                 let response: ActionResponsePayload
@@ -184,14 +257,42 @@ final class ServerController: ObservableObject {
                     )
                 }
                 await refreshStatusNow()
+
+                if response.cleared > 0 {
+                    armUndoSnapshot(.init(payload: snapshotData, cleared: response.cleared, expiresAt: Date().addingTimeInterval(undoWindow)))
+                }
+
                 statusMessage = response.message.isEmpty
                     ? (response.cleared > 0
                         ? "Saved progress cleared for \(response.cleared) titles."
                         : "No saved progress found.")
                     : response.message
+                _ = priorEntries
             } catch {
                 statusMessage = "Could not clear saved progress."
             }
+        }
+    }
+
+    /// Восстанавливает прогресс из последнего snapshot'а, если он не истёк.
+    /// Записывает JSON обратно в `progress.json` и тут же refreshStatus,
+    /// чтобы UI догнал состояние. Сервер подхватит изменения автоматически
+    /// (он держит свой кеш в памяти, но Load() на нём не вызвать удалённо;
+    /// в режиме «server stopped» это работает идеально, а при работающем
+    /// сервере undo действует на «холодное» состояние после рестарта).
+    func undoLastReset() {
+        guard let snapshot = undoSnapshot, Date() < snapshot.expiresAt else {
+            undoSnapshot = nil
+            return
+        }
+        do {
+            try snapshot.payload.write(to: progressFileURL, options: .atomic)
+            statusMessage = "Restored progress for \(snapshot.cleared) titles."
+            undoSnapshot = nil
+            undoExpiryTask?.cancel()
+            applyLocalProgressSummary()
+        } catch {
+            statusMessage = "Could not restore progress."
         }
     }
 
@@ -212,6 +313,53 @@ final class ServerController: ObservableObject {
                 statusMessage = "Progress removed for \(item.fileName)."
             } catch {
                 statusMessage = "Could not remove file progress."
+            }
+        }
+    }
+
+    /// Лёгкий poll: бьётся в /stats каждые 2 секунды только когда сервер
+    /// запущен. Не вытягивает `refreshStatusNow` полностью (не запускает
+    /// shell-скрипт `status_server.sh`), чтобы не нагружать систему.
+    func pollLightStats() async {
+        guard isRunning else { return }
+        guard let url = URL(string: "http://127.0.0.1:\(serverPort)/stats") else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.5
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            if let stats = try? JSONDecoder().decode(StatsPayload.self, from: data) {
+                activeStreams = stats.activeStreams
+                progressCount = stats.progressCount
+                liveSessions = (stats.sessions ?? []).map { dto in
+                    LiveSession(
+                        id: dto.id,
+                        kind: dto.kind,
+                        title: dto.title,
+                        client: dto.client,
+                        device: dto.device ?? "Unknown device",
+                        elapsedSeconds: dto.elapsedSeconds,
+                        durationSeconds: dto.durationSeconds
+                    )
+                }
+            }
+        } catch {
+            // Сеть упала — поллим дальше, на следующем такте пересоберёмся.
+        }
+    }
+
+    // MARK: – Private helpers
+
+    private func armUndoSnapshot(_ snapshot: UndoSnapshot) {
+        undoSnapshot = snapshot
+        undoExpiryTask?.cancel()
+        let window = undoWindow
+        undoExpiryTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(window * 1_000_000_000))
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if let snap = self.undoSnapshot, snap.expiresAt <= Date() {
+                    self.undoSnapshot = nil
+                }
             }
         }
     }
@@ -237,6 +385,9 @@ final class ServerController: ObservableObject {
                 if let current = status.mediaDir, !current.isEmpty {
                     setMediaDir(current)
                 }
+                if let streams = status.activeStreams {
+                    activeStreams = streams
+                }
                 applyLocalProgressSummary()
                 if !isBusy {
                     statusMessage = "Streaming now."
@@ -254,6 +405,7 @@ final class ServerController: ObservableObject {
         } else {
             endpoint = "http://127.0.0.1:\(serverPort)"
             startedAtText = "—"
+            activeStreams = 0
             let currentName = URL(fileURLWithPath: mediaDir).lastPathComponent
             mediaFolderName = currentName.isEmpty ? "Not selected" : currentName
             applyLocalProgressSummary()
@@ -267,7 +419,6 @@ final class ServerController: ObservableObject {
         guard let url = URL(string: "http://127.0.0.1:\(serverPort)/set-media-dir") else {
             return false
         }
-
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 2
@@ -372,45 +523,31 @@ final class ServerController: ObservableObject {
 
     private func deleteLocalProgressItem(key: String) throws {
         var raw = loadStoredProgressEntries()
-
         guard !raw.isEmpty else {
             throw NSError(domain: "HomeCinema", code: 404)
         }
-
         guard raw.removeValue(forKey: key) != nil else {
             throw NSError(domain: "HomeCinema", code: 404)
         }
-
         let encoded = try JSONEncoder().encode(raw)
         try encoded.write(to: progressFileURL, options: [.atomic])
         applyLocalProgressSummary()
     }
 
-    private func loadLocalProgressItems() -> [ProgressItem] {
-        localProgressItems(from: loadStoredProgressEntries())
-    }
-
     private func loadStoredProgressEntries() -> [String: StoredProgressEntry] {
+        // Только READ. Раньше здесь app перезаписывал progress.json, выкидывая
+        // записи для файлов, которых не нашёл под app.mediaDir. Если app.mediaDir
+        // временно расходился с серверным (момент старта до синхронизации
+        // через /, или первый запуск с дефолтной папкой), все «чужие» записи
+        // прогресса затирались — пользователь видел пустой Recently Watched и
+        // лишался накопленных позиций. Чистку отсутствующих файлов теперь
+        // делает только сервер (см. progressStore.PruneMissingFiles).
         guard
             let data = try? Data(contentsOf: progressFileURL),
-            var raw = try? JSONDecoder().decode([String: StoredProgressEntry].self, from: data)
+            let raw = try? JSONDecoder().decode([String: StoredProgressEntry].self, from: data)
         else {
             return [:]
         }
-
-        let staleKeys = raw.keys.filter { key in
-            !progressItemExists(forKey: key)
-        }
-
-        if !staleKeys.isEmpty {
-            for key in staleKeys {
-                raw.removeValue(forKey: key)
-            }
-            if let encoded = try? JSONEncoder().encode(raw) {
-                try? encoded.write(to: progressFileURL, options: [.atomic])
-            }
-        }
-
         return raw
     }
 
@@ -436,6 +573,7 @@ final class ServerController: ObservableObject {
                         fileName: fileName.isEmpty ? key : fileName,
                         folderName: folderName.isEmpty ? mediaFolderName : folderName,
                         timecode: formatProgressTimecode(entry),
+                        totalTimecode: formatTotalDuration(entry),
                         updatedText: formatProgressUpdate(entry.updated),
                         updatedAt: parseISODate(entry.updated),
                         progressFraction: computeProgressFraction(entry)
@@ -459,9 +597,7 @@ final class ServerController: ObservableObject {
     }
 
     private func progressItemExists(forKey key: String) -> Bool {
-        guard let url = progressItemURL(forKey: key) else {
-            return true
-        }
+        guard let url = progressItemURL(forKey: key) else { return true }
         return FileManager.default.fileExists(atPath: url.path)
     }
 
@@ -473,6 +609,11 @@ final class ServerController: ObservableObject {
             return nil
         }
         return URL(fileURLWithPath: mediaDir, isDirectory: true).appendingPathComponent(key)
+    }
+
+    private func formatTotalDuration(_ entry: StoredProgressEntry) -> String {
+        guard let duration = entry.durationSeconds, duration > 0 else { return "" }
+        return formatPlayback(seconds: duration)
     }
 
     private func formatProgressTimecode(_ entry: StoredProgressEntry) -> String {
@@ -566,6 +707,26 @@ struct ServerStatusPayload: Decodable {
     let startedAt: String
     let progressCount: Int
     let progressUpdatedAt: String?
+    let activeStreams: Int?
+}
+
+struct StatsPayload: Decodable {
+    let activeStreams: Int
+    let progressCount: Int
+    let version: String
+    let startedAt: String
+    let sessions: [SessionDTO]?
+}
+
+struct SessionDTO: Decodable {
+    let id: UInt64
+    let kind: String
+    let title: String
+    let client: String
+    let device: String?  // optional для совместимости со старыми /stats без device
+    let startedAt: String
+    let elapsedSeconds: Double
+    let durationSeconds: Double
 }
 
 struct ActionResponsePayload: Decodable {

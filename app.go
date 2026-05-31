@@ -13,7 +13,7 @@ const (
 	friendlyName      = "Home Cinema"
 	manufacturerName  = "Home Cinema"
 	modelName         = "HomeCinemaStreamer"
-	appVersion        = "1.6"
+	appVersion        = "1.8"
 	logFileName       = "server.log"
 	browseCacheTTL    = 5 * time.Second
 	burstAliveCount   = 5
@@ -24,8 +24,9 @@ const (
 var uuid = "673f-431d-90b6-homecinema-001"
 
 var (
-	objectIDRe = regexp.MustCompile(`<ObjectID>(.*?)</ObjectID>`)
-	flagRe     = regexp.MustCompile(`<BrowseFlag>(.*?)</BrowseFlag>`)
+	// callbackRe парсит UPnP CALLBACK-заголовок subscribe-запроса: формат
+	// <http://host/path> [<http://host2/path2>]. SOAP-тело Browse-запросов
+	// разбирается через extractXMLTag — strings.Index быстрее regexp.
 	callbackRe = regexp.MustCompile(`<([^>]+)>`)
 )
 
@@ -66,15 +67,15 @@ var (
 	tvStreamEnabled  = true
 	tvStreamFirst    = false
 	tvAutoFirst      = true
-	tvAutoFirstMbps  = 18
+	tvAutoFirstMbps  = 8
 	tvVideoCRF       = 22
 	tvVideoMaxrateMb = 10
-	tvVideoBufsizeMb = 20
+	tvVideoBufsizeMb = 40
 	tvVideoPreset    = "veryfast"
-	tvAudioKbps      = 192
-	tvAudioChannels  = 2
+	tvAudioKbps      = 384
+	tvAudioChannels  = 6
 	tvContentType    = "video/mpeg"
-	tvDLNAFeatures   = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+	tvDLNAFeatures   = "DLNA.ORG_PN=AVC_TS_HD_24_AC3_ISO;DLNA.ORG_OP=10;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"
 )
 
 var (

@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/koron/go-ssdp"
 )
 
-func startSSDP(ip string) {
+func startSSDP(ctx context.Context, wg *sync.WaitGroup, ip string) {
+	defer wg.Done()
 	location := fmt.Sprintf("http://%s:%s/desc.xml", ip, serverPort)
 	adverts := []struct {
 		st  string
@@ -35,30 +38,57 @@ func startSSDP(ip string) {
 		return
 	}
 
+	defer func() {
+		for _, ad := range ads {
+			_ = ad.Bye()
+		}
+	}()
+
 	for i := 0; i < burstAliveCount; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		for _, ad := range ads {
 			if err := ad.Alive(); err != nil {
 				log.Printf("Ошибка SSDP burst: %v", err)
 			}
 		}
-		time.Sleep(400 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(400 * time.Millisecond):
+		}
 	}
 
+	// Каскад «горячий → тёплый → медленный» announce. Раньше каждое окно
+	// открывалось через time.AfterFunc — оно жило вне ctx и могло сработать
+	// после shutdown. Теперь интервал «переключается» внутри select на основе
+	// прошедшего времени от старта.
 	fastAnnounce := time.NewTicker(5 * time.Second)
-	time.AfterFunc(1*time.Minute, func() { fastAnnounce.Stop() })
 	fastTicker := time.NewTicker(15 * time.Second)
-	time.AfterFunc(2*time.Minute, func() { fastTicker.Stop() })
 	slowTicker := time.NewTicker(60 * time.Second)
-	defer slowTicker.Stop()
+	defer fastAnnounce.Stop()
 	defer fastTicker.Stop()
+	defer slowTicker.Stop()
 
+	startedAt := time.Now()
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-fastAnnounce.C:
+			if time.Since(startedAt) > time.Minute {
+				continue
+			}
 			for _, ad := range ads {
 				_ = ad.Alive()
 			}
 		case <-fastTicker.C:
+			if time.Since(startedAt) > 2*time.Minute {
+				continue
+			}
 			for _, ad := range ads {
 				_ = ad.Alive()
 			}
@@ -72,7 +102,16 @@ func startSSDP(ip string) {
 	}
 }
 
-func respondMSearch(ip string) {
+// knownSTs — service types, на которые сервер отвечает по UPnP spec.
+var knownSTs = []string{
+	"ssdp:all",
+	"upnp:rootdevice",
+	"urn:schemas-upnp-org:device:mediaserver:1",
+	"urn:schemas-upnp-org:service:contentdirectory:1",
+}
+
+func respondMSearch(ctx context.Context, wg *sync.WaitGroup, ip string) {
+	defer wg.Done()
 	addr, err := net.ResolveUDPAddr("udp4", "239.255.255.250:1900")
 	if err != nil {
 		log.Printf("SSDP resolve error: %v", err)
@@ -91,12 +130,20 @@ func respondMSearch(ip string) {
 		log.Printf("SSDP set buffer error: %v", err)
 	}
 
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+
 	buf := make([]byte, 2048)
 	location := fmt.Sprintf("http://%s:%s/desc.xml", ip, serverPort)
 
 	for {
 		n, src, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("SSDP read error: %v", err)
 			continue
 		}
@@ -105,11 +152,36 @@ func respondMSearch(ip string) {
 			continue
 		}
 
-		st := "urn:schemas-upnp-org:device:MediaServer:1"
-		if strings.Contains(data, "ST: SSDP:ALL") {
-			st = "ssdp:all"
-		} else if strings.Contains(data, "CONTENTDIRECTORY") {
-			st = "urn:schemas-upnp-org:service:ContentDirectory:1"
+		// Извлекаем значение ST из запроса.
+		st := extractST(data)
+		if st == "" {
+			continue
+		}
+
+		// Отвечаем только на известные нам типы (UPnP spec §1.3.2).
+		matched := false
+		for _, known := range knownSTs {
+			if strings.Contains(st, known) {
+				matched = true
+				break
+			}
+		}
+		// Также отвечаем на поиск нашего конкретного UUID.
+		if !matched && strings.Contains(st, strings.ToUpper(uuid)) {
+			matched = true
+		}
+		if !matched {
+			continue
+		}
+
+		// Нормализуем ST для ответа: если ssdp:all — отвечаем как MediaServer.
+		responseST := "urn:schemas-upnp-org:device:MediaServer:1"
+		if strings.Contains(st, "SSDP:ALL") {
+			responseST = "ssdp:all"
+		} else if strings.Contains(st, "CONTENTDIRECTORY") {
+			responseST = "urn:schemas-upnp-org:service:ContentDirectory:1"
+		} else if strings.Contains(st, "ROOTDEVICE") {
+			responseST = "upnp:rootdevice"
 		}
 
 		res := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
@@ -120,14 +192,33 @@ func respondMSearch(ip string) {
 			"SERVER: MacOS/13.0 UPnP/1.0 DLNADOC/1.50 HomeCinema/%s\r\n"+
 			"ST: %s\r\n"+
 			"USN: uuid:%s::%s\r\n"+
-			"\r\n", time.Now().UTC().Format(time.RFC1123), location, appVersion, st, uuid, st)
+			"\r\n", time.Now().UTC().Format(time.RFC1123), location, appVersion, responseST, uuid, responseST)
 
+		// Короткий deadline на write: на нестабильной сети WriteToUDP может
+		// зависнуть, а каждый зависший вызов блокирует приём следующих
+		// M-SEARCH-ов из общего сокета.
+		_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 		if _, err := conn.WriteToUDP([]byte(res), src); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("SSDP write error: %v", err)
 		} else {
-			log.Printf("📣 M-SEARCH ответ: %s -> %s", st, src)
+			log.Printf("📣 M-SEARCH ответ: %s -> %s", responseST, src)
+		}
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+}
+
+// extractST извлекает значение заголовка ST из M-SEARCH запроса (в верхнем регистре).
+func extractST(data string) string {
+	for _, line := range strings.Split(data, "\r\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ST:") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "ST:"))
 		}
 	}
+	return ""
 }
 
 func primaryInterface() *net.Interface {

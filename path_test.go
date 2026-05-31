@@ -74,6 +74,15 @@ func TestParseRange(t *testing.T) {
 		{name: "fixed", header: "bytes=100-199", size: 1000, wantStart: 100, wantEnd: 199, wantOK: true},
 		{name: "suffix", header: "bytes=-100", size: 1000, wantStart: 900, wantEnd: 999, wantOK: true},
 		{name: "multi", header: "bytes=0-1,5-6", size: 1000, wantOK: false},
+		{name: "end clamped to size-1", header: "bytes=100-2000", size: 1000, wantStart: 100, wantEnd: 999, wantOK: true},
+		{name: "start at last byte", header: "bytes=999-999", size: 1000, wantStart: 999, wantEnd: 999, wantOK: true},
+		{name: "start past end → reject", header: "bytes=1000-", size: 1000, wantOK: false},
+		{name: "start past end closed → reject", header: "bytes=1000-2000", size: 1000, wantOK: false},
+		{name: "suffix larger than size", header: "bytes=-2000", size: 1000, wantStart: 0, wantEnd: 999, wantOK: true},
+		{name: "end < start", header: "bytes=500-100", size: 1000, wantOK: false},
+		{name: "missing prefix", header: "100-200", size: 1000, wantOK: false},
+		{name: "malformed", header: "bytes=abc-def", size: 1000, wantOK: false},
+		{name: "empty bytes=", header: "bytes=", size: 1000, wantOK: false},
 	}
 
 	for _, tt := range tests {

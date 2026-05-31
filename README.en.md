@@ -4,9 +4,9 @@
 
 Home Cinema is a small Go-based DLNA/UPnP server with a companion macOS control app. If you just want to point your TV at a folder of movies without bringing in Plex, Jellyfin, a database, or a full media stack, this project is built for that workflow.
 
-The current release prepared in this repository is **1.7**.
+The current release prepared in this repository is **1.8**.
 
-MacOS App Screenshots:
+macOS app screenshots:
 
 <img width="408" height="276" alt="Light" src="https://github.com/user-attachments/assets/a4c35f90-6df3-4cd9-a1d8-ff930cf9da99" />
 <img width="408" height="276" alt="Dark" src="https://github.com/user-attachments/assets/4959e841-9816-411e-811e-27e18015e5cc" />
@@ -15,7 +15,7 @@ MacOS App Screenshots:
 - Exposes a DLNA/UPnP `MediaServer` and `ContentDirectory`.
 - Streams video over HTTP with `Range`, so seek and resume behave the way DLNA clients expect.
 - Stores watch progress on disk and survives client or server restarts.
-- Can start a movie directly from the saved watch position when progress already exists.
+- Can resume from a saved position for the TV stream and `/resume/` flow.
 - Lets you inspect, reset, and remove individual progress entries from the macOS app.
 - Can generate an alternative TV stream through `ffmpeg` when direct playback over Wi‑Fi is shaky.
 - Provides local control endpoints for changing the media folder and managing saved progress.
@@ -36,10 +36,11 @@ go build -o HomeCinemaServer .
 Then pick **Home Cinema** from the DLNA source list on your TV or set-top box.
 
 ## If playback stutters on Wi‑Fi
-`--tv-stream` is enabled by default. The server can add an `ffmpeg`-based alternative stream, and for heavier files it can even move that stream higher in the resource order so clients are more likely to choose the smoother option.
+`--tv-stream` is enabled by default. The server can add an `ffmpeg`-based alternative stream. For heavy files and some HEVC/HDR MKVs, that TV stream is automatically moved first because many TVs cannot start those MKVs directly.
 
 - If `ffmpeg` is missing, the server disables that extra stream automatically and logs a warning.
 - `ffprobe` is recommended for duration and timecode handling.
+- Some TVs still display that compatible stream as `mpg` or show the end time as `0:00`. The server sends DLNA duration and time-seek headers, but the final display depends on the TV.
 
 Example tuning:
 
@@ -65,9 +66,9 @@ The main files are:
 
 You can override the location with `HOMECINEMA_DATA_DIR` or `--data-dir`.
 
-Starting with `1.7`, the app also cleans up stale progress entries for files that no longer exist in the current media library, so deleted movies stop reappearing in the UI.
+The server cleans up stale progress entries for files that no longer exist in the current media library (on folder change and hourly), so deleted movies stop reappearing in the UI.
 
-When a movie already has saved progress, the server may prefer the resource that lets the TV start directly from that point. That makes "resume playback" much more reliable, but it comes with a clear limitation: after such a start, many DLNA clients can no longer seek properly and may stop showing the remaining playback time. At the moment this is an intentional tradeoff in favor of dependable resume behavior on TVs.
+Saved progress is used in movie titles (`[▶ 12:34 - 1:45:00]`), in the macOS app, and in the TV stream when the server can start ffmpeg from a known position. Some DLNA clients may still handle seeking and full-duration display differently from a local player.
 
 ## Control and security
 The control endpoints are localhost-only by default:
@@ -105,7 +106,9 @@ Launch it:
 ./build/home-cinema/run_control_app.sh
 ```
 
-The build script creates a universal `Home Cinema.app`, bundles a fresh server binary, and wires in the helper scripts used to start and stop the service. In `1.7`, the UI moves further toward a polished glass-style control deck with an `Auto/Light/Dark` theme switcher, softer background motion, more tactile action buttons, and a tighter saved-progress panel.
+The build script creates a universal `Home Cinema.app`, bundles a fresh server binary, and wires in the helper scripts used to start and stop the service. In `1.8`, the window shows `ON AIR`, active streams, saved progress, and an undo banner after clearing progress. Status polling pauses when the window is inactive.
+
+Minimum requirement: **macOS 14 (Sonoma)**. For older systems use the standalone server binary.
 
 ## Local pre-release check
 The repository includes a small pre-publish verification script:
@@ -126,6 +129,8 @@ The repository has unit tests around the core server behavior:
 - XML escaping
 - safe path normalization and joining
 - `Range` parsing
+- DLNA duration/time-seek headers
+- active `/stats` sessions
 - watch progress persistence
 
 Run them manually with:
@@ -144,6 +149,8 @@ go test ./...
 
 ## Docs
 - Change history — [CHANGELOG.md](CHANGELOG.md)
+- Russian release notes for `1.8` — [releases/v1.8.md](releases/v1.8.md)
+- Release notes for `1.8` — [releases/v1.8.en.md](releases/v1.8.en.md)
 - Release notes for `1.7` — [releases/v1.7.en.md](releases/v1.7.en.md)
 - Russian release notes for `1.7` — [releases/v1.7.md](releases/v1.7.md)
 - Security policy — [SECURITY.md](SECURITY.md)
