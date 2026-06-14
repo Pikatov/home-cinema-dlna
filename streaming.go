@@ -128,8 +128,19 @@ func isProbeStreamRange(start, end, totalSize int64) bool {
 	return length < 1024*1024 || start > totalSize*9/10
 }
 
-func withDirectPlaybackStream(r *http.Request, filePath string, start, end, totalSize int64) (*http.Request, func()) {
+func shouldReplaceDirectPlaybackStream(start, end, totalSize int64) bool {
 	if isProbeStreamRange(start, end, totalSize) {
+		return false
+	}
+	// DLNA clients often open the same item as GET without Range, then
+	// immediately as Range: bytes=0-... while probing the container. Both are
+	// still startup reads, not a user seek. Cancelling the first one here makes
+	// some TVs loop forever through open/probe/reopen.
+	return start > 0
+}
+
+func withDirectPlaybackStream(r *http.Request, filePath string, start, end, totalSize int64) (*http.Request, func()) {
+	if !shouldReplaceDirectPlaybackStream(start, end, totalSize) {
 		return r, func() {}
 	}
 	streamKey := tvStreamKey(filePath, r.RemoteAddr)

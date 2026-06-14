@@ -36,9 +36,21 @@ func shouldPreferTVResource(path string, size int64, durationSeconds float64) bo
 		return true
 	}
 	if durationSeconds <= 0 {
-		return false
+		return shouldPreferTVResourceWithoutDuration(path, size)
 	}
 	return averageBitrateMbps(size, durationSeconds) >= float64(tvAutoFirstMbps)
+}
+
+func shouldPreferTVResourceWithoutDuration(path string, size int64) bool {
+	if size < 512*1024*1024 {
+		return false
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mkv", ".webm":
+		return true
+	default:
+		return false
+	}
 }
 
 func shouldTranscodeForTVCompatibility(path string) bool {

@@ -1,0 +1,2 @@
+57aeeabe50c4b6233260c8da1fb2522261a7f506b4e8add7580064eb5c8568c9  Home-Cinema-1.8.1-macOS-app.zip
+79ce01c5692f9332ab66f7599834d95787e7df22e74a65794a4caca358f6211a  Home-Cinema-1.8.1-macOS-server.zip

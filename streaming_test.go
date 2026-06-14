@@ -190,6 +190,57 @@ func TestResumeSeekFromRange(t *testing.T) {
 	}
 }
 
+func TestShouldReplaceDirectPlaybackStream(t *testing.T) {
+	const fileSize = int64(100 * 1024 * 1024)
+
+	cases := []struct {
+		name  string
+		start int64
+		end   int64
+		want  bool
+	}{
+		{
+			name:  "initial full GET without range",
+			start: 0,
+			end:   fileSize - 1,
+			want:  false,
+		},
+		{
+			name:  "initial Range from zero",
+			start: 0,
+			end:   fileSize - 1,
+			want:  false,
+		},
+		{
+			name:  "short metadata probe",
+			start: 0,
+			end:   64*1024 - 1,
+			want:  false,
+		},
+		{
+			name:  "tail metadata probe",
+			start: fileSize - 64*1024,
+			end:   fileSize - 1,
+			want:  false,
+		},
+		{
+			name:  "real seek into file",
+			start: 5 * 1024 * 1024,
+			end:   fileSize - 1,
+			want:  true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := shouldReplaceDirectPlaybackStream(c.start, c.end, fileSize)
+			if got != c.want {
+				t.Fatalf("replace = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
 func TestExtractST(t *testing.T) {
 	cases := []struct {
 		name string

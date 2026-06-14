@@ -13,7 +13,7 @@ const (
 	friendlyName      = "Home Cinema"
 	manufacturerName  = "Home Cinema"
 	modelName         = "HomeCinemaStreamer"
-	appVersion        = "1.8"
+	appVersion        = "1.8.1"
 	logFileName       = "server.log"
 	browseCacheTTL    = 5 * time.Second
 	burstAliveCount   = 5

@@ -19,12 +19,29 @@ import (
 	"time"
 )
 
+func toolCandidates(name, envName string) []string {
+	candidates := make([]string, 0, 6)
+	if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
+		candidates = append(candidates, v)
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, name),
+			filepath.Join(exeDir, "..", "Resources", "bin", name),
+		)
+	}
+	candidates = append(candidates,
+		filepath.Join("/opt/homebrew/bin", name),
+		filepath.Join("/usr/local/bin", name),
+		filepath.Join("/usr/bin", name),
+		name,
+	)
+	return candidates
+}
+
 func ffprobeBin() string {
-	for _, p := range []string{
-		"/opt/homebrew/bin/ffprobe",
-		"/usr/local/bin/ffprobe",
-		"/usr/bin/ffprobe",
-	} {
+	for _, p := range toolCandidates("ffprobe", "HOMECINEMA_FFPROBE") {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -35,11 +52,7 @@ func ffprobeBin() string {
 var ffprobeExe = ffprobeBin()
 
 func ffmpegBin() string {
-	for _, p := range []string{
-		"/opt/homebrew/bin/ffmpeg",
-		"/usr/local/bin/ffmpeg",
-		"/usr/bin/ffmpeg",
-	} {
+	for _, p := range toolCandidates("ffmpeg", "HOMECINEMA_FFMPEG") {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -64,26 +77,46 @@ func resolveExec(bin string) (string, bool) {
 	if bin == "" {
 		return "", false
 	}
-	candidate := bin
-	if strings.ContainsRune(bin, filepath.Separator) {
-		if !isExecutable(bin) {
-			return "", false
-		}
-	} else {
-		p, err := exec.LookPath(bin)
-		if err != nil {
-			return "", false
-		}
-		candidate = p
+
+	candidates := []string{bin}
+	switch filepath.Base(bin) {
+	case "ffmpeg":
+		candidates = append(candidates, toolCandidates("ffmpeg", "HOMECINEMA_FFMPEG")...)
+	case "ffprobe":
+		candidates = append(candidates, toolCandidates("ffprobe", "HOMECINEMA_FFPROBE")...)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(ctx, candidate, "-version").Run(); err != nil {
-		log.Printf("⚠️ %s найден, но не запускается: %v", filepath.Base(candidate), err)
-		return "", false
+	seen := make(map[string]bool, len(candidates))
+	for _, raw := range candidates {
+		if raw == "" || seen[raw] {
+			continue
+		}
+		seen[raw] = true
+
+		candidate := raw
+		if strings.ContainsRune(raw, filepath.Separator) {
+			if !isExecutable(raw) {
+				continue
+			}
+		} else {
+			p, err := exec.LookPath(raw)
+			if err != nil {
+				continue
+			}
+			candidate = p
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := exec.CommandContext(ctx, candidate, "-version").Run()
+		cancel()
+		if err != nil {
+			log.Printf("⚠️ %s найден, но не запускается: %v", candidate, err)
+			continue
+		}
+
+		return candidate, true
 	}
-	return candidate, true
+	return "", false
 }
 
 func probeErrorString(err error, out []byte) string {

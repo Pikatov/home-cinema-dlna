@@ -36,6 +36,15 @@ func TestShouldPreferTVResource(t *testing.T) {
 	if !shouldPreferTVResource("Show.S01E01.1080P.10bit.HDR.h265.WEB-DLRip.mkv", 2*1024*1024*1024, 3600) {
 		t.Fatal("expected TV resource to be preferred for HEVC/HDR/10-bit MKV even at a lower bitrate")
 	}
+	if !shouldPreferTVResource("Movie.WEB-DLRip.mkv", 2*1024*1024*1024, 0) {
+		t.Fatal("expected TV resource to be preferred for a large MKV while duration is still unknown")
+	}
+	if shouldPreferTVResource("Clip.mkv", 100*1024*1024, 0) {
+		t.Fatal("did not expect TV resource to be preferred for a small MKV while duration is unknown")
+	}
+	if shouldPreferTVResource("Movie.mp4", 2*1024*1024*1024, 0) {
+		t.Fatal("did not expect TV resource to be preferred for MP4 solely because duration is unknown")
+	}
 
 	tvAutoFirst = false
 	if shouldPreferTVResource("movie.mkv", 9*1024*1024*1024, 3600) {
