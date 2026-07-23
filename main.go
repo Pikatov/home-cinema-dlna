@@ -211,6 +211,8 @@ func main() {
 		relRaw := strings.TrimPrefix(r.URL.Path, "/tv/")
 		if strings.HasSuffix(relRaw, ".ts") {
 			relRaw = strings.TrimSuffix(relRaw, ".ts")
+		} else if strings.HasSuffix(relRaw, ".mp4") {
+			relRaw = strings.TrimSuffix(relRaw, ".mp4")
 		}
 		relPath, ok := safeMediaRelPathFromURL(relRaw)
 		if !ok || relPath == "" {

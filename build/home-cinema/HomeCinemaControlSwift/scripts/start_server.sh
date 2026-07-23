@@ -22,7 +22,7 @@ if [[ -f "$PID_FILE" ]]; then
   rm -f "$PID_FILE"
 fi
 
-nohup "$SERVER_PATH" --media-dir "$MEDIA_DIR" --port "$PORT" --data-dir "$STATE_DIR" >>"$LOG_FILE" 2>&1 &
+nohup "$SERVER_PATH" --media-dir "$MEDIA_DIR" --port "$PORT" --data-dir "$STATE_DIR" --tv-stream-first >>"$LOG_FILE" 2>&1 &
 PID=$!
 printf '%s\n' "$PID" > "$PID_FILE"
 

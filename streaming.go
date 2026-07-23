@@ -645,45 +645,107 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 	}
 
 	w.Header().Set("Content-Type", tvContentType)
-	w.Header().Set("Accept-Ranges", "none")
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("TransferMode.DLNA.ORG", "Streaming")
 	w.Header().Set("ContentFeatures.DLNA.ORG", tvDLNAFeatures)
 	w.Header().Set("Cache-Control", "no-transform")
 
-	// Determine seek position. Byte Range on transcoded MPEG-TS is not meaningful:
-	// TVs that honor DLNA time-seek send TimeSeekRange.dlna.org instead.
-	var seekSecs float64
-	if requestedSeek, ok := parseTimeSeekRangeStart(r.Header.Get("TimeSeekRange.dlna.org"), meta.DurationSeconds); ok {
-		seekSecs = requestedSeek
-		log.Printf("⏩ TV TIME SEEK: %s → %.0f сек", requestedRelPath, seekSecs)
-	} else {
-		// Initial start (no Range, or bytes=0-): check for saved resume position.
-		if entry, ok := getProgressEntry(progressKey); ok {
-			if entry.Seconds > 0 {
-				seekSecs = entry.Seconds
-			} else if entry.Position > 0 && entry.Size > 0 && entry.DurationSeconds > 0 {
-				if fi2, err2 := os.Stat(filePath); err2 == nil && fi2.Size() == entry.Size {
-					seekSecs = entry.DurationSeconds * float64(entry.Position) / float64(entry.Size)
-				}
-			}
-			if seekSecs > 0 {
-				log.Printf("▶️ TV RESUME: %s от %.0f сек", requestedRelPath, seekSecs)
-			}
+	rangeHdr := r.Header.Get("Range")
+	responseStatus := http.StatusOK
+	if rangeHdr != "" {
+		_, _, ok := parseRange(rangeHdr, info.Size())
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
+			http.Error(w, "Неверный диапазон", http.StatusRequestedRangeNotSatisfiable)
+			return
 		}
 	}
+
+	if streamDebugEnabled {
+		extra := ""
+		if streamDebugHeaders {
+			extra = fmt.Sprintf(" hdr{range=%q timeseek=%q transfer=%q getfeat=%q conn=%q}",
+				rangeHdr,
+				r.Header.Get("TimeSeekRange.dlna.org"),
+				r.Header.Get("transferMode.dlna.org"),
+				r.Header.Get("GetContentFeatures.dlna.org"),
+				r.Header.Get("Connection"),
+			)
+		}
+		log.Printf("DBG tv_req %s %s ua=%q file=%q%s", r.Method, r.RemoteAddr, shortUA(r.UserAgent()), requestedRelPath, extra)
+	}
+
+	savedSeekSecs := tvSavedSeekSeconds(progressKey, filePath, info.Size())
+	replacePreviousStream := false
+	// Determine seek position. Some TVs honor DLNA time-seek, others still send
+	// byte Range on the advertised resource. For the transcoded MPEG-TS stream
+	// we treat that byte offset as a position on the original file timeline and
+	// restart ffmpeg from the matching timestamp.
+	seekSecs := savedSeekSecs
+	requestedTimeSeek, timeSeekOK := parseTimeSeekRangeStart(r.Header.Get("TimeSeekRange.dlna.org"), meta.DurationSeconds)
+	if timeSeekOK && requestedTimeSeek <= 0 {
+		// Часть ТВ шлёт TimeSeekRange.dlna.org: npt=0- не как настоящий запрос
+		// «с начала», а как рутинный реконнект/keep-alive прямо посреди
+		// идущего просмотра (видно в логах: между обычными продолжениями с
+		// сохранённой позиции внезапно проскакивает npt=0-, и тут же снова
+		// идут запросы с прежней позицией). Раньше это трактовалось как
+		// настоящий seek: убивали активный ffmpeg и перезапускали с 0 —
+		// отсюда видимые фризы и «убегание» сохранённой позиции вперёд
+		// после серии таких реконнектов. Для байтового Range такой же трюк
+		// ("bytes=0-") уже был исключён из seek-детекции (см. resumeSeekFromRange
+		// и хотфикс 1.8.1) — здесь делаем то же самое для симметрии.
+		timeSeekOK = false
+	}
+	if timeSeekOK {
+		seekSecs = requestedTimeSeek
+		replacePreviousStream = r.Method != http.MethodHead
+		log.Printf("⏩ TV TIME SEEK: %s → %.0f сек", requestedRelPath, seekSecs)
+	} else if requestedSeek, ok := resumeSeekFromRange(rangeHdr, info.Size(), meta.DurationSeconds, savedSeekSecs); ok {
+		seekSecs = requestedSeek
+		replacePreviousStream = r.Method != http.MethodHead
+		if start, end, ok := parseRange(rangeHdr, info.Size()); ok && start > 0 {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, info.Size()))
+			responseStatus = http.StatusPartialContent
+		}
+		log.Printf("⏩ TV BYTE SEEK: %s → %.0f сек (%s)", requestedRelPath, seekSecs, rangeHdr)
+	} else {
+		if savedSeekSecs > 0 {
+			log.Printf("▶️ TV RESUME: %s от %.0f сек", requestedRelPath, seekSecs)
+		}
+	}
+
+	// watchSession хранит позицию просмотра на уровне (файл, клиент), а не
+	// отдельного HTTP-подключения. Часть ТВ переоткрывает /tv/ каждые
+	// несколько секунд НА ПРОТЯЖЕНИИ ВСЕГО просмотра (не только при seek/паузе
+	// — обычное поведение конкретной модели), убивая и пересоздавая ffmpeg.
+	// Если каждый такой реконнект вести собственный локальный отсчёт времени
+	// «с нуля», реальная просмотренная секунда не совпадает с суммой этих
+	// отсчётов. watchSession копит РЕАЛЬНО доставленное время между
+	// подключениями и не резервирует «простой» между ними (когда активного
+	// ffmpeg вообще нет) — только явный seek или разрыв дольше tvSessionGapTimeout
+	// сбрасывает её на новую позицию.
+	streamKey := tvStreamKey(filePath, r.RemoteAddr)
+	watchSession := tvResolveWatchSession(streamKey, seekSecs, replacePreviousStream)
+	seekSecs = watchSession.currentPosition()
+	// connectionBase — позиция, с которой стартует ffmpeg именно ЭТОГО
+	// подключения. Собственный отчёт ffmpeg о ходе кодирования (-progress)
+	// считается relative к этой точке, см. updateFromProgress.
+	connectionBase := seekSecs
 
 	setDLNATimeSeekHeadersWithOffset(w, meta.DurationSeconds, seekSecs)
 
 	if r.Method == http.MethodHead {
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+		w.WriteHeader(responseStatus)
 		return
 	}
 
 	// Немедленно отменяем предыдущий ffmpeg того же клиента — он освободит слот
 	// семафора до того, как мы начнём ждать. Без этого seek ждал бы пока старый
 	// процесс сам заметит EPIPE (1–5 с) → видимый фриз на ТВ.
-	streamKey := tvStreamKey(filePath, r.RemoteAddr)
-	cancelPreviousTVStream(streamKey)
+	if replacePreviousStream {
+		cancelPreviousTVStream(streamKey)
+	}
 
 	// Семафор: ограничиваем число одновременных ffmpeg-транскодов.
 	if !acquireTVSlot(r.Context()) {
@@ -700,11 +762,31 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 		"-loglevel", "error",
 		"-analyzeduration", "200000",
 		"-probesize", "65536",
+		// -progress pipe:3 — машиночитаемый отчёт о ходе кодирования на
+		// отдельном дескрипторе (см. cmd.ExtraFiles ниже). Это единственный
+		// источник, которому можно доверять для прогресса: если ТВ перестало
+		// вычитывать данные (не закрыв TCP-соединение — обычное поведение при
+		// «стопе»), наш Write() в сокет блокируется → блокируется чтение из
+		// stdout ffmpeg → блокируется сам ffmpeg (стандартный пайп заполнен) →
+		// -progress перестаёт слать новые отметки. Настенные часы в этот
+		// момент продолжали бы тикать и считали бы «подвес» просмотренным
+		// временем — отсюда и убегала позиция при остановке/паузе.
+		"-progress", "pipe:3",
+		"-nostats",
 	}
 	if seekSecs > 0 {
 		// -ss before -i = быстрый input-seek по keyframe.
 		args = append(args, "-ss", fmt.Sprintf("%.3f", seekSecs))
 	}
+	// -re: читать вход с исходным фреймрейтом вместо «на полной скорости CPU».
+	// Без него ffmpeg на быстрой машине кодирует в разы быстрее реального
+	// времени, ТВ забуферивает контент далеко вперёд по факту переданных
+	// байт, а наш recordProgressSeconds (elapsed = seekSecs + wall-clock)
+	// считает это временем воспроизведения — отсюда позиция resume «убегала»
+	// вперёд от места, где реально стояла пауза. -re синхронизирует темп
+	// кодирования с реальным временем, так что wall-clock снова означает
+	// секунду видео.
+	args = append(args, "-re")
 	outputArgs := []string{
 		"-i", filePath,
 		"-map", "0:v:0",
@@ -730,6 +812,15 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 		"-flush_packets", "1",
 		"-muxdelay", "0",
 		"-muxpreload", "0",
+		// Без -output_ts_offset муксер сам решает, с какого PTS начинать
+		// новый выходной файл — оно не привязано к нашему -ss и не совпадает
+		// с seekSecs, который мы уже объявили в TimeSeekRange.dlna.org.
+		// ТВ, который для своего «сколько сейчас играет» ориентируется на PTS
+		// потока, а не на наши заголовки, в этот момент видел рассинхрон
+		// (вплоть до 0:00) — то самое «время сбрасывается» при паузе/seek,
+		// когда ffmpeg перезапускается. Явный offset делает PTS потока
+		// предсказуемо равным seekSecs.
+		"-output_ts_offset", fmt.Sprintf("%.3f", seekSecs),
 	}
 	outputArgs = append(outputArgs, "pipe:1")
 	args = append(args, outputArgs...)
@@ -740,19 +831,35 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 	defer cancelCmd()
 	handle := &tvStreamHandle{cancel: cancelCmd}
 
+	progressR, progressW, perr := os.Pipe()
+	if perr != nil {
+		http.Error(w, "Не удалось запустить ffmpeg", http.StatusInternalServerError)
+		return
+	}
+
 	t0 := time.Now()
 	cmd := exec.CommandContext(cmdCtx, ffmpegExe, args...)
+	cmd.ExtraFiles = []*os.File{progressW} // fd 3 в дочернем процессе — см. "-progress pipe:3"
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		progressR.Close()
+		progressW.Close()
 		http.Error(w, "Не удалось запустить ffmpeg", http.StatusInternalServerError)
 		return
 	}
 	stderr, _ := cmd.StderrPipe()
 
 	if err := cmd.Start(); err != nil {
+		progressR.Close()
+		progressW.Close()
 		http.Error(w, "Не удалось запустить ffmpeg", http.StatusInternalServerError)
 		return
 	}
+	// Наша копия пишущего конца больше не нужна — держит её теперь только
+	// ffmpeg. Не закрыть её здесь означает никогда не увидеть EOF на
+	// progressR после завершения процесса (родительский процесс тоже держит
+	// дескриптор открытым).
+	progressW.Close()
 	// Публикуем handle ТОЛЬКО после успешного Start: до этого нечего отменять,
 	// а параллельный запрос на тот же ключ мог бы «отменить» ещё не запущенный
 	// процесс — безопасно, но грязно.
@@ -760,6 +867,9 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 	defer tvFileStreams.CompareAndDelete(streamKey, handle)
 	if streamDebugEnabled {
 		log.Printf("DBG tv_start file=%q ffmpeg_start=%s", requestedRelPath, time.Since(t0).Round(time.Millisecond))
+	}
+	if responseStatus != http.StatusOK {
+		w.WriteHeader(responseStatus)
 	}
 
 	stderrDone := make(chan struct{})
@@ -774,12 +884,32 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 		}
 	}()
 
+	// Разбираем -progress: строки вида "out_time_us=12345678". Это
+	// единственный источник, которому доверяем для позиции — см. комментарий
+	// у "-progress pipe:3" выше про то, почему настенные часы ненадёжны.
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		defer progressR.Close()
+		sc := bufio.NewScanner(progressR)
+		for sc.Scan() {
+			v, ok := strings.CutPrefix(sc.Text(), "out_time_us=")
+			if !ok {
+				continue
+			}
+			us, perr := strconv.ParseInt(v, 10, 64)
+			if perr != nil {
+				continue
+			}
+			watchSession.updateFromProgress(connectionBase, float64(us)/1e6)
+			recordProgressSeconds(progressKey, watchSession.currentPosition(), meta.DurationSeconds)
+		}
+	}()
+
 	log.Printf("📺 TV stream: %s (maxrate=%dM buf=%dM crf=%d ac3=%dk ch=%d)", requestedRelPath, tvVideoMaxrateMb, tvVideoBufsizeMb, tvVideoCRF, tvAudioKbps, tvAudioChannels)
 
 	flusher, _ := w.(http.Flusher)
 
-	started := time.Now()
-	lastSaved := time.Now()
 	firstByteLogged := false
 	firstWrite := true
 	copyBuf := make([]byte, pipeCopyBufSize)
@@ -811,11 +941,6 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 				flusher.Flush()
 				firstWrite = false
 			}
-			if time.Since(lastSaved) >= progressUpdateEvery {
-				elapsed := seekSecs + time.Since(started).Seconds()
-				recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
-				lastSaved = time.Now()
-			}
 		}
 		if rErr != nil {
 			break
@@ -823,13 +948,113 @@ func serveTVStream(w http.ResponseWriter, r *http.Request, filePath, requestedRe
 	}
 
 done:
-	elapsed := seekSecs + time.Since(started).Seconds()
-	recordProgressSeconds(progressKey, elapsed, meta.DurationSeconds)
 	// Гарантировано отменяем процесс и ждём окончания, чтобы не оставить
 	// зомби-ffmpeg, который ещё держит CPU/диск.
 	cancelCmd()
 	<-stderrDone
+	// Дожидаемся progressDone ДО финальной записи прогресса: иначе можем
+	// прочитать watchSession.currentPosition() раньше, чем до неё дойдёт
+	// последняя отметка "-progress" от уже завершающегося ffmpeg.
+	<-progressDone
 	_ = cmd.Wait()
+	recordProgressSeconds(progressKey, watchSession.currentPosition(), meta.DurationSeconds)
+}
+
+// tvSessionGapTimeout — если для (файл, клиент) не было ни одного запроса
+// дольше этого интервала, считаем, что предыдущий просмотр реально закончился
+// (пользователь ушёл/переключился), и следующий запрос начинает НОВУЮ
+// watch-сессию с нуля, а не продолжает старую.
+const tvSessionGapTimeout = 12 * time.Second
+
+// tvWatchSession хранит позицию воспроизведения для пары (файл, клиент)
+// /tv/ через границы HTTP-переподключений. Позиция продвигается ТОЛЬКО по
+// авторитетным отчётам ffmpeg (-progress, см. serveTVStream), а не по
+// настенным часам: если ТВ перестало вычитывать данные (пользователь нажал
+// «стоп», но TCP-соединение ещё не закрылось — обычное поведение части
+// моделей, которое может длиться много секунд), наш Write() в сокет
+// блокируется, из-за чего блокируется и чтение из stdout ffmpeg, из-за чего
+// блокируется сам ffmpeg (пайп заполнен) — и его -progress перестаёт
+// отправлять новые отметки. Время на этот «подвес» не засчитывается совсем,
+// в отличие от отсчёта по time.Since(), который в этот момент продолжал бы
+// тикать, хотя зритель ничего не получал (ровно то, что вызывало «убегание»
+// позиции вперёд при паузе/остановке).
+type tvWatchSession struct {
+	mu       sync.Mutex
+	position float64 // последняя известная абсолютная позиция, секунды от начала файла
+	lastSeen time.Time
+}
+
+var (
+	tvWatchSessionsMu sync.Mutex
+	tvWatchSessions   = make(map[string]*tvWatchSession)
+)
+
+// tvResolveWatchSession возвращает watch-сессию для ключа (файл, клиент).
+// Новая сессия заводится только при явном seek (genuineSeek) или если с
+// прошлого запроса прошло больше tvSessionGapTimeout — иначе переиспользуем
+// существующую, чтобы очередной служебный реконнект не сбрасывал накопленную
+// позицию.
+func tvResolveWatchSession(streamKey string, requestedSeekSecs float64, genuineSeek bool) *tvWatchSession {
+	tvWatchSessionsMu.Lock()
+	defer tvWatchSessionsMu.Unlock()
+
+	now := time.Now()
+	if existing, ok := tvWatchSessions[streamKey]; ok {
+		existing.mu.Lock()
+		stale := now.Sub(existing.lastSeen) > tvSessionGapTimeout
+		if !genuineSeek && !stale {
+			existing.lastSeen = now
+			existing.mu.Unlock()
+			return existing
+		}
+		existing.mu.Unlock()
+	}
+	s := &tvWatchSession{position: requestedSeekSecs, lastSeen: now}
+	tvWatchSessions[streamKey] = s
+	return s
+}
+
+func (s *tvWatchSession) currentPosition() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.position
+}
+
+// updateFromProgress продвигает позицию сессии по отчёту ffmpeg ТЕКУЩЕГО
+// подключения: connectionBase — позиция, с которой стартовал именно этот
+// ffmpeg (значение currentPosition() на момент его запуска), outTimeSeconds —
+// сколько секунд контента он, по собственным данным, уже вывел с этой точки.
+// Двигаем только вперёд: устаревший/меньший отчёт (например, от уже
+// отменённого предыдущего подключения) не откатывает позицию назад.
+func (s *tvWatchSession) updateFromProgress(connectionBase, outTimeSeconds float64) {
+	if outTimeSeconds < 0 {
+		return
+	}
+	candidate := connectionBase + outTimeSeconds
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if candidate > s.position {
+		s.position = candidate
+	}
+}
+
+func tvSavedSeekSeconds(progressKey, filePath string, fileSize int64) float64 {
+	entry, ok := getProgressEntry(progressKey)
+	if !ok {
+		return 0
+	}
+	if entry.Seconds > 0 {
+		return entry.Seconds
+	}
+	if entry.Position > 0 && entry.Size > 0 && entry.DurationSeconds > 0 {
+		if fileSize == entry.Size {
+			return entry.DurationSeconds * float64(entry.Position) / float64(entry.Size)
+		}
+		if fi, err := os.Stat(filePath); err == nil && fi.Size() == entry.Size {
+			return entry.DurationSeconds * float64(entry.Position) / float64(entry.Size)
+		}
+	}
+	return 0
 }
 
 // serveResume отдаёт виртуальный файл "от сохранённой позиции до конца".

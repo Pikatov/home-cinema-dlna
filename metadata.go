@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -134,6 +135,17 @@ func probeErrorString(err error, out []byte) string {
 
 type videoMeta struct {
 	DurationSeconds float64
+	// VideoCodec/AudioCodec/PixFmt заполняются только полным ffprobe (не
+	// быстрым бинарным парсером Matroska) — см. probeFormatAndCodecs.
+	VideoCodec string
+	AudioCodec string
+	PixFmt     string
+	// CodecProbed отличает «длительность нашли быстрым парсером/ffprobe
+	// с истёкшим таймаутом» (кодек ещё неизвестен) от «полный ffprobe
+	// отработал» — без этого флага warmVideoMetaAsync считал бы запись
+	// готовой сразу после матрёшечного fast-path и никогда не подтягивал
+	// бы кодек в фоне.
+	CodecProbed bool
 	// LastProbedAt — момент последнего ffprobe для файла. Используется чтобы
 	// не перепрашивать битые файлы (DurationSeconds==0) на каждом запросе —
 	// см. metaNegativeTTL и warmVideoMetaAsync.
@@ -144,6 +156,13 @@ type videoMeta struct {
 // у которых длительность не определилась (битый контейнер, отсутствие
 // видеопотока). Положительные результаты живут «вечно» (до clearMetaCache).
 const metaNegativeTTL = 5 * time.Minute
+
+// codecProbeMinTimeout — минимальный бюджет времени, при котором мы вообще
+// пытаемся довыполнить ffprobe за кодеком после быстрого бинарного парсера
+// длительности Matroska. Короткие синхронные вызовы (/resume/ с 300 мс)
+// не должны спотыкаться о запуск ffprobe — кодек в таком случае донабирается
+// позже через warmVideoMetaAsync/warmupMetaCache.
+const codecProbeMinTimeout = 1 * time.Second
 
 var (
 	metaCacheMu sync.RWMutex
@@ -182,13 +201,13 @@ func warmVideoMetaAsync(filePath string) {
 		return
 	}
 	if m, ok := getVideoMetaCached(filePath); ok {
-		// Положительный кеш — выходим, ffprobe не нужен.
-		if m.DurationSeconds > 0 {
+		// Полностью готовый положительный кеш (длительность + кодек) — выходим.
+		if m.DurationSeconds > 0 && m.CodecProbed {
 			return
 		}
 		// Отрицательный кеш в пределах TTL — тоже выходим, чтобы битый файл
 		// не дёргал ffprobe на каждом запросе.
-		if !m.LastProbedAt.IsZero() && time.Since(m.LastProbedAt) < metaNegativeTTL {
+		if m.DurationSeconds <= 0 && !m.LastProbedAt.IsZero() && time.Since(m.LastProbedAt) < metaNegativeTTL {
 			return
 		}
 	}
@@ -215,24 +234,41 @@ func getVideoMeta(filePath string) videoMeta {
 
 func getVideoMetaWithTimeout(filePath string, timeout time.Duration) videoMeta {
 	metaCacheMu.RLock()
-	if m, ok := metaCache[filePath]; ok {
-		// Положительный кеш — отдаём. Отрицательный — отдаём в пределах TTL,
-		// чтобы битые файлы не запускали новый ffprobe на каждом запросе.
-		if m.DurationSeconds > 0 || (!m.LastProbedAt.IsZero() && time.Since(m.LastProbedAt) < metaNegativeTTL) {
-			metaCacheMu.RUnlock()
-			return m
-		}
-	}
+	cached, hasCached := metaCache[filePath]
 	metaCacheMu.RUnlock()
 
-	if m, ok := getContainerDuration(filePath); ok {
-		metaCacheMu.Lock()
-		metaCache[filePath] = m
-		metaCacheMu.Unlock()
-		return m
+	if hasCached {
+		// Полностью готовый положительный кеш — отдаём. Отрицательный — отдаём
+		// в пределах TTL, чтобы битые файлы не запускали новый ffprobe на
+		// каждом запросе.
+		if cached.DurationSeconds > 0 && cached.CodecProbed {
+			return cached
+		}
+		if cached.DurationSeconds <= 0 && !cached.LastProbedAt.IsZero() && time.Since(cached.LastProbedAt) < metaNegativeTTL {
+			return cached
+		}
+	}
+
+	if !hasCached {
+		if m, ok := getContainerDuration(filePath); ok {
+			metaCacheMu.Lock()
+			metaCache[filePath] = m
+			metaCacheMu.Unlock()
+			cached = m
+			hasCached = true
+			// Кодек этот быстрый парсер не знает. Короткие синхронные вызовы
+			// не должны ждать ffprobe ради него — он довыполнится позже через
+			// warmVideoMetaAsync/warmupMetaCache.
+			if timeout > 0 && timeout < codecProbeMinTimeout {
+				return m
+			}
+		}
 	}
 
 	if ffprobeExe == "" {
+		if hasCached {
+			return cached
+		}
 		return videoMeta{LastProbedAt: time.Now()}
 	}
 
@@ -247,25 +283,93 @@ func getVideoMetaWithTimeout(filePath string, timeout time.Duration) videoMeta {
 		ctx = context.Background()
 	}
 
-	m := videoMeta{LastProbedAt: time.Now()}
-	out, err := exec.CommandContext(ctx, ffprobeExe,
-		"-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		filePath,
-	).CombinedOutput()
-	if err == nil {
-		if secs, err2 := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); err2 == nil && secs > 0 {
-			m.DurationSeconds = secs
-		}
-	} else if streamDebugEnabled {
-		log.Printf("DBG ffprobe failed file=%q err=%s", filePath, probeErrorString(err, out))
+	probed, ok := probeFormatAndCodecs(ctx, filePath)
+	if !ok {
+		// ffprobe не отработал (таймаут/ошибка) — сохраняем то, что уже
+		// знаем (например, длительность от быстрого парсера), и помечаем
+		// момент попытки для отрицательного TTL.
+		result := cached
+		result.LastProbedAt = time.Now()
+		metaCacheMu.Lock()
+		metaCache[filePath] = result
+		metaCacheMu.Unlock()
+		return result
 	}
 
+	if probed.DurationSeconds <= 0 && cached.DurationSeconds > 0 {
+		probed.DurationSeconds = cached.DurationSeconds
+	}
+	probed.CodecProbed = true
+	probed.LastProbedAt = time.Now()
 	metaCacheMu.Lock()
-	metaCache[filePath] = m
+	metaCache[filePath] = probed
 	metaCacheMu.Unlock()
-	return m
+	return probed
+}
+
+// ffprobeStreamInfo — то, что нам нужно из ffprobe -show_streams в JSON:
+// тип и имя кодека, плюс pix_fmt для определения 10-бит видео.
+type ffprobeStreamInfo struct {
+	CodecType string `json:"codec_type"`
+	CodecName string `json:"codec_name"`
+	PixFmt    string `json:"pix_fmt"`
+}
+
+type ffprobeFormatInfo struct {
+	Duration string `json:"duration"`
+}
+
+type ffprobeOutput struct {
+	Streams []ffprobeStreamInfo `json:"streams"`
+	Format  ffprobeFormatInfo   `json:"format"`
+}
+
+// probeFormatAndCodecs запускает один ffprobe-вызов и достаёт длительность
+// вместе с кодеком первого видео- и аудиопотока. Кодек нужен, чтобы решать,
+// сможет ли ТВ декодировать файл напрямую (см. shouldTranscodeForTVCompatibility) —
+// одного расширения/имени файла недостаточно: многие рипы не помечают в
+// имени ни HEVC, ни 10-бит, хотя именно это чаще всего мешает встроенному
+// декодеру ТВ открыть такой MKV.
+func probeFormatAndCodecs(ctx context.Context, filePath string) (videoMeta, bool) {
+	out, err := exec.CommandContext(ctx, ffprobeExe,
+		"-v", "error",
+		"-show_entries", "format=duration:stream=codec_type,codec_name,pix_fmt",
+		"-print_format", "json",
+		filePath,
+	).CombinedOutput()
+	if err != nil {
+		if streamDebugEnabled {
+			log.Printf("DBG ffprobe failed file=%q err=%s", filePath, probeErrorString(err, out))
+		}
+		return videoMeta{}, false
+	}
+
+	var parsed ffprobeOutput
+	if jsonErr := json.Unmarshal(out, &parsed); jsonErr != nil {
+		if streamDebugEnabled {
+			log.Printf("DBG ffprobe json parse failed file=%q err=%v", filePath, jsonErr)
+		}
+		return videoMeta{}, false
+	}
+
+	m := videoMeta{}
+	if secs, convErr := strconv.ParseFloat(strings.TrimSpace(parsed.Format.Duration), 64); convErr == nil && secs > 0 {
+		m.DurationSeconds = secs
+	}
+	for _, s := range parsed.Streams {
+		switch s.CodecType {
+		case "video":
+			if m.VideoCodec == "" {
+				m.VideoCodec = s.CodecName
+				m.PixFmt = s.PixFmt
+			}
+		case "audio":
+			if m.AudioCodec == "" {
+				m.AudioCodec = s.CodecName
+			}
+		}
+	}
+	return m, true
 }
 
 func getContainerDuration(filePath string) (videoMeta, bool) {
@@ -441,4 +545,37 @@ func warmupMetaCache(dir string) {
 			log.Printf("✅ ffprobe кеш: %d файлов в %s", count, redactPath(dir))
 		}
 	}()
+}
+
+// isHEVCVideoCodec сообщает, декодирует ли ffprobe видеопоток как HEVC/H.265 —
+// именно этот кодек чаще всего не тянут встроенные декодеры ТВ старше
+// нескольких лет, даже когда рип не помечен как h265/hevc в имени файла.
+func isHEVCVideoCodec(codec string) bool {
+	codec = strings.ToLower(strings.TrimSpace(codec))
+	return codec == "hevc" || codec == "h265"
+}
+
+// isHighBitDepthPixFmt сообщает про 10-бит (и выше) видео — ffprobe отдаёт
+// это как часть pix_fmt (yuv420p10le, yuv422p10le, yuv420p12le и т.п.),
+// а не как отдельное поле.
+func isHighBitDepthPixFmt(pixFmt string) bool {
+	pixFmt = strings.ToLower(strings.TrimSpace(pixFmt))
+	if pixFmt == "" {
+		return false
+	}
+	return strings.Contains(pixFmt, "p10") || strings.Contains(pixFmt, "p12") || strings.Contains(pixFmt, "p16")
+}
+
+// isTVIncompatibleAudioCodec — консервативный список аудиокодеков, которые
+// декодер большинства DLNA-ТВ (при прямой отдаче файла, не HDMI-passthrough
+// через AVR) не умеет проигрывать. Видео при этом может быть полностью
+// совместимым — сам факт такого аудио уже достаточная причина форсировать
+// TV-поток (ffmpeg перекодирует звук в AC3).
+func isTVIncompatibleAudioCodec(codec string) bool {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "dts", "dts_hd", "truehd", "mlp", "flac", "opus":
+		return true
+	default:
+		return false
+	}
 }

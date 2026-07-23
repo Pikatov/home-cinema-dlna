@@ -4,6 +4,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResumeRemuxContainer(t *testing.T) {
@@ -238,6 +239,110 @@ func TestShouldReplaceDirectPlaybackStream(t *testing.T) {
 				t.Fatalf("replace = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestTVDLNAFeaturesAdvertiseTimeSeek: транскодированный /tv/-поток — это
+// «живой» ремукс (каждый seek убивает и перезапускает ffmpeg), а не
+// байт-адресуемый статичный файл. DLNA.ORG_OP=10 (только time-seek) —
+// корректный способ объявить его seekable: TimeSeekRange.dlna.org — штатный
+// механизм именно для таких потоков. OP=11 (ещё и байт-сик) заставлял часть
+// пультов ДУ пытаться сначала перематывать по байтам, что для «живого»
+// потока не работает предсказуемо, и они просто отключали аппаратный
+// FF/REW целиком (хотя ползунок внутри самого плеера продолжал слать
+// TimeSeekRange и работал).
+func TestTVDLNAFeaturesAdvertiseTimeSeek(t *testing.T) {
+	if !strings.Contains(tvDLNAFeatures, "DLNA.ORG_OP=10") {
+		t.Fatalf("tvDLNAFeatures = %q, want time-seek support advertised", tvDLNAFeatures)
+	}
+}
+
+// TestTVWatchSessionUpdateFromProgress покрывает основной сценарий бага:
+// позиция должна двигаться только по авторитетным отчётам ffmpeg
+// (-progress), не по настенным часам — если отчётов не было (ffmpeg завис,
+// пайп заполнен, потому что ТВ перестало читать), позиция стоит на месте.
+func TestTVWatchSessionUpdateFromProgress(t *testing.T) {
+	s := &tvWatchSession{position: 10}
+
+	s.updateFromProgress(10, 3.5)
+	if pos := s.currentPosition(); pos != 13.5 {
+		t.Fatalf("pos = %v, want 13.5", pos)
+	}
+
+	// Более поздний отчёт того же подключения — двигаемся дальше вперёд.
+	s.updateFromProgress(10, 4.2)
+	if pos := s.currentPosition(); pos != 14.2 {
+		t.Fatalf("pos = %v, want 14.2", pos)
+	}
+
+	// Устаревший/меньший отчёт (например, от уже отменённого подключения) не
+	// должен откатывать позицию назад.
+	s.updateFromProgress(10, 1.0)
+	if pos := s.currentPosition(); pos != 14.2 {
+		t.Fatalf("pos = %v, want unchanged 14.2 after a stale/smaller report", pos)
+	}
+}
+
+func TestTVWatchSessionNoProgressLeavesPositionUnchanged(t *testing.T) {
+	s := &tvWatchSession{position: 42}
+	// Ни одного отчёта не пришло (например, соединение оборвалось до первого
+	// байта, или ffmpeg завис из-за того, что ТВ перестало читать) — позиция
+	// должна остаться ровно там, где сессия стартовала.
+	if pos := s.currentPosition(); pos != 42 {
+		t.Fatalf("pos = %v, want unchanged base 42", pos)
+	}
+}
+
+func TestTVResolveWatchSessionReusesForContinuation(t *testing.T) {
+	tvWatchSessionsMu.Lock()
+	delete(tvWatchSessions, "test-key-continue")
+	tvWatchSessionsMu.Unlock()
+
+	first := tvResolveWatchSession("test-key-continue", 5, false)
+	first.updateFromProgress(5, 2.0)
+
+	// Реконнект без явного seek вскоре после — должен вернуть ТУ ЖЕ сессию
+	// (с уже накопленной позицией), а не начинать заново с requestedSeekSecs.
+	second := tvResolveWatchSession("test-key-continue", 5, false)
+	if second != first {
+		t.Fatal("expected the same session to be reused for a non-seek reconnect")
+	}
+	if pos := second.currentPosition(); pos != 7 {
+		t.Fatalf("pos = %v, want 7 (accumulated position preserved)", pos)
+	}
+}
+
+func TestTVResolveWatchSessionResetsOnGenuineSeek(t *testing.T) {
+	tvWatchSessionsMu.Lock()
+	delete(tvWatchSessions, "test-key-seek")
+	tvWatchSessionsMu.Unlock()
+
+	first := tvResolveWatchSession("test-key-seek", 5, false)
+	first.updateFromProgress(5, 2.0)
+
+	second := tvResolveWatchSession("test-key-seek", 90, true)
+	if second == first {
+		t.Fatal("expected a fresh session on a genuine seek")
+	}
+	if pos := second.currentPosition(); pos != 90 {
+		t.Fatalf("pos = %v, want 90 (fresh session anchored at the seek target)", pos)
+	}
+}
+
+func TestTVResolveWatchSessionResetsAfterGap(t *testing.T) {
+	tvWatchSessionsMu.Lock()
+	delete(tvWatchSessions, "test-key-gap")
+	tvWatchSessionsMu.Unlock()
+
+	first := tvResolveWatchSession("test-key-gap", 5, false)
+	// Симулируем разрыв длиннее tvSessionGapTimeout, не дожидаясь его в реальном времени.
+	first.mu.Lock()
+	first.lastSeen = time.Now().Add(-tvSessionGapTimeout - time.Second)
+	first.mu.Unlock()
+
+	second := tvResolveWatchSession("test-key-gap", 5, false)
+	if second == first {
+		t.Fatal("expected a fresh session after a gap longer than tvSessionGapTimeout")
 	}
 }
 

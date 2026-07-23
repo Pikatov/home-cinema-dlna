@@ -22,7 +22,7 @@ func averageBitrateMbps(size int64, durationSeconds float64) float64 {
 	return (float64(size) * 8) / durationSeconds / 1e6
 }
 
-func shouldPreferTVResource(path string, size int64, durationSeconds float64) bool {
+func shouldPreferTVResource(path string, size int64, durationSeconds float64, meta videoMeta) bool {
 	if !tvStreamEnabled {
 		return false
 	}
@@ -32,7 +32,7 @@ func shouldPreferTVResource(path string, size int64, durationSeconds float64) bo
 	if !tvAutoFirst {
 		return false
 	}
-	if shouldTranscodeForTVCompatibility(path) {
+	if shouldTranscodeForTVCompatibility(path, meta) {
 		return true
 	}
 	if durationSeconds <= 0 {
@@ -53,11 +53,28 @@ func shouldPreferTVResourceWithoutDuration(path string, size int64) bool {
 	}
 }
 
-func shouldTranscodeForTVCompatibility(path string) bool {
+// shouldTranscodeForTVCompatibility решает, нужно ли форсировать TV-поток
+// для контейнеров, которые прямой /video/ отдаёт «как есть» без перекодирования.
+// Предпочитаем реальный кодек из ffprobe (meta.VideoCodec/PixFmt/AudioCodec) —
+// он появляется не сразу (кеш прогревается в фоне), поэтому пока он неизвестен,
+// используем старую эвристику по имени файла как fallback. Многие рипы не
+// помечают в имени ни HEVC, ни 10-бит, поэтому одной эвристики недостаточно —
+// именно из-за неё часть MKV с необозначенным HEVC/10-бит видео или DTS/TrueHD
+// звуком отправлялась напрямую и не запускалась на ТВ, чей декодер такое не тянет.
+func shouldTranscodeForTVCompatibility(path string, meta videoMeta) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext != ".mkv" && ext != ".webm" {
 		return false
 	}
+	if meta.CodecProbed {
+		return isHEVCVideoCodec(meta.VideoCodec) ||
+			isHighBitDepthPixFmt(meta.PixFmt) ||
+			isTVIncompatibleAudioCodec(meta.AudioCodec)
+	}
+	return shouldTranscodeForTVCompatibilityByName(path)
+}
+
+func shouldTranscodeForTVCompatibilityByName(path string) bool {
 	name := strings.ToLower(filepath.Base(path))
 	return strings.Contains(name, "h265") ||
 		strings.Contains(name, "h.265") ||
@@ -229,8 +246,15 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 			// менее красиво, чем ffmpeg-remux, зато на DLNA-ТВ стабильнее и не
 			// зависит от контейнера. Для seconds-based прогресса нужна длительность,
 			// для byte-based достаточно совпадения размера файла.
+			// Кодек ещё не пробован фоновым ffprobe — подтягиваем его в фоне,
+			// чтобы при следующем Browse (кеш живёт browseCacheTTL=5с) решение
+			// TV-first уже опиралось на реальный кодек, а не только на имя файла.
+			if !meta.CodecProbed {
+				warmVideoMetaAsync(fullPath)
+			}
+
 			hasResume := false
-			preferTVResource := !hasResume && tvStreamEnabled && shouldPreferTVResource(fullPath, info.Size(), meta.DurationSeconds)
+			preferTVResource := !hasResume && tvStreamEnabled && shouldPreferTVResource(fullPath, info.Size(), meta.DurationSeconds, meta)
 
 			// ID элемента: путь файла + флаг наличия прогресса. ТВ часто кешируют
 			// DLNA-каталог и при повторном открытии берут URL из своего кеша —
@@ -268,7 +292,8 @@ func handleContentDirectory(ip string) http.HandlerFunc {
 				resParts = append(resParts, resumeRes, fileRes)
 			} else if tvStreamEnabled {
 				tvProto := fmt.Sprintf("http-get:*:%s:%s", tvContentType, tvDLNAFeatures)
-				tvRes := fmt.Sprintf(`&lt;res%s protocolInfo="%s"&gt;%s&lt;/res&gt;`,
+				tvRes := fmt.Sprintf(`&lt;res size="%d"%s protocolInfo="%s"&gt;%s&lt;/res&gt;`,
+					info.Size(),
 					durationAttr,
 					escapeXMLAttr(tvProto),
 					escapeXMLText(tvURL),
